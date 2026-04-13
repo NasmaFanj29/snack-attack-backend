@@ -112,13 +112,11 @@ app.post('/place-order', async (req, res) => {
       // 3. Insert Items
      for (const item of items || []) {
     // 💡 Check every possible ID field coming from React
-   const itemId = item.id || item.menu_id || null;
+   const itemId = item.id || item.menu_id || item.databaseId;
 
-if (!itemId) {
-  return res.status(400).json({
-    error: "Missing item ID",
-    item
-  });
+if (!itemId || isNaN(itemId)) {
+    console.log("BAD ITEM:", item);
+    continue;
 }
 
     await connection.query(
