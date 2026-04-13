@@ -108,22 +108,22 @@ app.post('/place-order', async (req, res) => {
       );
       const orderId = orderResult.insertId;
       console.log("ITEMS RECEIVED:", items);
+
       // 3. Insert Items
       for (const item of items || []) {
-      const itemId = item.id || item.databaseId;
+      const itemId = item.id || item.databaseId || item.menu_id;
 
-      if (!itemId) continue;
+    // ✅ Skip eza ma fī ID kirmal ma ya3mel "Out of range"
+    if (!itemId) {
+    console.log("❌ Skipping item due to missing ID:", item.name);
+    continue;
+  }
 
-      await connection.query(
-        'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
-        [
-          orderId,
-          itemId,
-          item.quantity || 1,
-          item.price || 0
-        ]
-      );
-    }
+    await connection.query(
+    'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
+    [ orderId, itemId, item.quantity || 1, item.price || 0 ]
+  );
+}
 
       await connection.commit();
       res.json({ success: true, orderId: orderId });
