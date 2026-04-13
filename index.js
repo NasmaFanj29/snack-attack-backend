@@ -144,6 +144,27 @@ app.get('/order-status/:id', async (req, res) => {
   }
 });
 
+app.get('/order/:id', async (req, res) => {
+  try {
+    const [order] = await pool.query(
+      'SELECT * FROM orders WHERE id = ?',
+      [req.params.id]
+    );
+
+    const [items] = await pool.query(
+      'SELECT * FROM order_items WHERE order_id = ?',
+      [req.params.id]
+    );
+
+    res.json({
+      order: order[0],
+      items
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* --- 4. ADMIN DASHBOARD --- */
 app.get('/admin/orders', async (req, res) => {
   try {
