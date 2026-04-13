@@ -1,220 +1,3 @@
-<<<<<<< HEAD
-const express = require('express');
-const cors = require('cors');
-const pool = require('./db'); // Ensure this file has your Aiven MySQL config
-const path = require("path");
-const app = express();
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use("/images", express.static(path.join(__dirname, "images")));
-
-/* --- 1. AUTHENTICATION (Multi-Account) --- */
-
-app.post('/api/admin/login', async (req, res) => {
-  const { phone_number, password } = req.body;
-  try {
-    const [rows] = await pool.query(
-      'SELECT user_id, full_name, phone_number, role FROM users WHERE phone_number = ? AND role IN ("admin", "staff")', 
-      [phone_number]
-    );
-
-    if (rows.length > 0) {
-      const user = rows[0];
-      if (password === "snack123") { 
-        res.json({ 
-          success: true, 
-          admin: { id: user.user_id, name: user.full_name, role: user.role } 
-        });
-      } else {
-        res.status(401).json({ success: false, message: "Wrong password" });
-      }
-    } else {
-      res.status(403).json({ success: false, message: "Access Denied: Not an Admin/Staff" });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* --- 2. MENU & EXTRAS --- */
-
-app.get('/menu', async (req, res) => {
-  try {
-    const [rows] = await pool.query('SELECT * FROM menuitems'); 
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/item-extras/:id", async (req, res) => {
-  try {
-    const [results] = await pool.query(
-      `SELECT eo.id, eo.name, eo.price 
-       FROM extra_options eo 
-       JOIN item_extras ie ON eo.id = ie.extra_id 
-       WHERE ie.item_id = ?`, 
-      [req.params.id]
-    );
-    res.json(results);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/place-order', async (req, res) => {
-  const { customer, table_id, total_price, items, payment_splits } = req.body;
-  const pointsToEarn = Math.floor(parseFloat(total_price)); 
-
-  if (!customer || !customer.phone) {
-    return res.status(400).json({ error: "Customer phone is required" });
-  }
-
-  try {
-    const connection = await pool.getConnection();
-    await connection.beginTransaction();
-
-    try {
-      // 1. User Logic
-      let [userRows] = await connection.query('SELECT user_id FROM users WHERE phone_number = ?', [customer.phone]);
-      let userId;
-      if (userRows.length === 0) {
-        const [newUser] = await connection.query(
-          'INSERT INTO users (full_name, phone_number, qlub_balance, role) VALUES (?, ?, ?, "user")',
-          [customer.name || 'Guest', customer.phone, 0]
-        );
-        userId = newUser.insertId;
-      } else {
-        userId = userRows[0].user_id;
-      }
-
-      // 2. Insert Order (✅ FIXED: 5 question marks for 5 values)
-      const [orderResult] = await connection.query(
-        'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, ?, ?, ?)',
-        [table_id || 1, total_price, 'Pending', userId, JSON.stringify(payment_splits)] 
-      );
-      const orderId = orderResult.insertId;
-
-      // 3. Insert Items
-      for (const item of items) {
-        const finalId = (item.id && item.id < 1000000) ? item.id : null;
-        await connection.query(
-          'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
-          [orderId, finalId, item.quantity, item.price]
-        );
-      }
-
-      // 4. Update Points
-      await connection.query('CALL UpdateUserQlub(?, ?)', [customer.phone, pointsToEarn]);
-      
-      await connection.commit();
-      res.json({ success: true, orderId: orderId, pointsEarned: pointsToEarn });
-
-    } catch (err) {
-      await connection.rollback();
-      throw err;
-    } finally {
-      connection.release();
-    }
-  } catch (err) {
-    // ⚠️ Shufi el-Detailed Error hon bel-terminal eza ba3do ma mshe el-7al
-    console.error("ORDER ERROR:", err.message); 
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get('/order-status/:id', async (req, res) => {
-  try {
-    const [rows] = await pool.query('SELECT status FROM orders WHERE id = ?', [req.params.id]);
-    if (rows.length > 0) {
-      res.json({ status: rows[0].status });
-    } else {
-      res.status(404).json({ message: "Order not found" });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* --- 4. ADMIN DASHBOARD ROUTES --- */
-
-app.get('/admin/orders', async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT o.id, o.total_price, o.status, o.created_at, o.table_id, o.payment_splits,
-             u.full_name, u.phone_number
-      FROM orders o
-      LEFT JOIN users u ON o.user_id = u.user_id
-      ORDER BY o.created_at DESC
-    `);
-    res.json(rows);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ✅ THE FIXED DELETE ROUTE (Async/Await Style)
-app.delete("/admin/orders/:id", async (req, res) => {
-  
-  const { id } = req.params;
-  try {
-    // 1. Delete associated order items first (FK constraint)
-    await pool.query("DELETE FROM order_items WHERE order_id = ?", [id]);
-    
-    // 2. Delete the order record
-    const [result] = await pool.query("DELETE FROM orders WHERE id = ?", [id]);
-
-    if (result.affectedRows > 0) {
-      res.status(200).json({ success: true, message: "Order deleted successfully" });
-    } else {
-      res.status(404).json({ success: false, message: "Order not found" });
-    }
-  } catch (err) {
-    console.error("Delete error:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.put('/admin/orders/:id/status', async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body; 
-
-  try {
-    // Nesta3mel pool.query kirmal el-Aiven pool
-    const [result] = await pool.query('UPDATE orders SET status = ? WHERE id = ?', [status, id]);
-
-    if (result.affectedRows > 0) {
-      return res.json({ success: true });
-    } else {
-      return res.status(404).json({ success: false, message: "Order not found" });
-    }
-  } catch (err) {
-    // ⚠️ DAROURE: Shūfi hal-ghalat bel-VS Code terminal
-    console.error("MYSQL TRIGGER/SQL ERROR:", err.sqlMessage || err.message); 
-    return res.status(500).json({ success: false, error: err.sqlMessage });
-  }
-});
-
-app.get('/admin/stats', async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT 
-        COUNT(id) as total_orders, 
-        IFNULL(SUM(total_price), 0) as total_sales 
-      FROM orders 
-      WHERE DATE(created_at) = CURDATE() AND status != 'Cancelled'
-    `);
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Server Start
-const PORT = process.env.PORT || 5000;
-=======
 const express = require('express');
 const cors = require('cors');
 const pool = require('./db'); 
@@ -284,7 +67,7 @@ app.get("/item-extras/:id", async (req, res) => {
 app.post('/place-order', async (req, res) => {
   const { customer, table_id, total_price, items, payment_splits } = req.body;
   
-  // ✅ Handle missing customer info for 'Requested' initial step
+  // Handle missing customer info for 'Requested' initial step
   const customerPhone = customer?.phone || "000000";
   const customerName = customer?.name || "Guest";
 
@@ -306,7 +89,7 @@ app.post('/place-order', async (req, res) => {
         userId = userRows[0].user_id;
       }
 
-      // 2. Insert Order as 'Requested'
+      // 2. Insert Order as 'Requested' (Needs Admin Acceptance)
       const [orderResult] = await connection.query(
         'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, "Requested", ?, ?)',
         [table_id || 1, total_price, userId, JSON.stringify(payment_splits || [])] 
@@ -378,14 +161,13 @@ app.put('/admin/orders/:id/status', async (req, res) => {
   const { status, customer, payment_splits } = req.body; 
 
   try {
-    // ✅ Handle final payment updates if data is provided
     if (status === "Paid" && customer) {
         await pool.query(
             'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
             [status, JSON.stringify(payment_splits || []), id]
         );
-        // Optional: Update points here
-        await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, Math.floor(0)]); 
+        const pointsToEarn = Math.floor(0); // Add logic if needed
+        await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, pointsToEarn]); 
     } else {
         await pool.query('UPDATE orders SET status = ? WHERE id = ?', [status, id]);
     }
@@ -408,5 +190,4 @@ app.get('/admin/stats', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
->>>>>>> 6e694a2 (Initial backend commit)
 app.listen(PORT, () => console.log(`🚀 Snack Attack Backend running on port ${PORT}`));
