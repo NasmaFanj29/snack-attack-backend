@@ -97,8 +97,14 @@ app.post('/place-order', async (req, res) => {
 
       // 2. Insert Order as 'Requested' (Wait for Admin Approval)
       const [orderResult] = await connection.query(
-        'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, "Requested", ?, ?)',
-        [table_id || 1, total_price, userId, JSON.stringify(payment_splits || [])] 
+       'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, ?, ?, ?)',
+        [
+          table_id || 1,
+          total_price,
+          "Requested",
+          userId,
+          JSON.stringify(payment_splits || [])
+        ]
       );
       const orderId = orderResult.insertId;
 
