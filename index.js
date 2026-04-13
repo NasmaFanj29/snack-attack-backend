@@ -195,14 +195,21 @@ app.put('/admin/orders/:id/status', async (req, res) => {
   const { status, customer, payment_splits } = req.body; 
 
   try {
-    if (status === "Paid" && customer) {
-        await pool.query(
-            'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
-            [status, JSON.stringify(payment_splits || []), id]
-        );
-      //  await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, 0]); 
-    } else {
-        await pool.query('UPDATE orders SET status = ? WHERE id = ?', [status, id]);
+    // 1. Update el status w el payment splits bel awal
+    await pool.query(
+        'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
+        [status, JSON.stringify(payment_splits || []), id]
+    );
+
+    // 2. Iza fi customer info, m-n-fatesh 3al user_id w m-n-3mello update
+    if (customer && customer.name) {
+        const [rows] = await pool.query('SELECT user_id FROM orders WHERE id = ?', [id]);
+        if (rows.length > 0) {
+            await pool.query(
+                'UPDATE users SET full_name = ?, phone_number = ? WHERE user_id = ?',
+                [customer.name, customer.phone || "000000", rows[0].user_id]
+            );
+        }
     }
     res.json({ success: true });
   } catch (err) {
