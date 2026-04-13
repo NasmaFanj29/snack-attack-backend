@@ -172,7 +172,7 @@ app.put('/admin/orders/:id/status', async (req, res) => {
             'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
             [status, JSON.stringify(payment_splits || []), id]
         );
-        await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, 0]); 
+      //  await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, 0]); 
     } else {
         await pool.query('UPDATE orders SET status = ? WHERE id = ?', [status, id]);
     }
