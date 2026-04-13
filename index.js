@@ -6,7 +6,7 @@ const app = express();
 
 // ✅ 1. Middleware: Lezem y-koun bi-awal el-fayl kirmal el-browser ma ya3mel block
 app.use(cors({
-  origin: ["http://localhost:3000", "https://snackattacknasma.netlify.app"],
+  origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true
 }));
