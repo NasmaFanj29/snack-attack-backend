@@ -22,7 +22,7 @@ const pool = mysql.createPool({
   host: "mysql-3d11ed7-fanjnasma-4923.a.aivencloud.com",
   port: 26847,
   user: "avnadmin",
-  password: "AVNS_naebXmyEzZIlic1Xuaf", // 👈 Check el-password el-7a2i2iye
+  password: process.env.DB_PASSWORD, // 👈 Check el-password el-7a2i2iye
   database: "defaultdb",
   ssl: { 
     rejectUnauthorized: false // 👈 DARURE ktīr kirmal Aiven
