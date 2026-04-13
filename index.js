@@ -110,11 +110,12 @@ app.post('/place-order', async (req, res) => {
       console.log("ITEMS RECEIVED:", items);
 
       // 3. Insert Items
-      for (const item of items || []) {
+     for (const item of items || []) {
+    // 💡 Check every possible ID field coming from React
     const itemId = item.id || item.menu_id || item.databaseId;
 
     if (!itemId) {
-        console.log("❌ Skipping item with missing ID:", item.name);
+        console.log("❌ Skipping item due to missing ID:", item.name);
         continue;
     }
 
