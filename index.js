@@ -4,7 +4,7 @@ const pool = require('./db');
 const path = require("path");
 const app = express();
 
-// ✅ 1. Middleware ma3 el-CORS Fix kirmal ma ya3te Block mnel-browser
+// ✅ 1. Middleware: Lezem y-koun bi-awal el-fayl kirmal el-browser ma ya3mel block
 app.use(cors({
   origin: ["http://localhost:3000", "https://snackattacknasma.netlify.app"],
   methods: ["GET", "POST", "PUT", "DELETE"],
@@ -89,7 +89,7 @@ app.post('/place-order', async (req, res) => {
         userId = userRows[0].user_id;
       }
 
-      // 2. Insert Order as 'Requested' (Needs Admin Acceptance)
+      // 2. Insert Order as 'Requested' (Wait for Admin Approval)
       const [orderResult] = await connection.query(
         'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, "Requested", ?, ?)',
         [table_id || 1, total_price, userId, JSON.stringify(payment_splits || [])] 
@@ -189,4 +189,4 @@ app.get('/admin/stats', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Snack Attack Backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Snack Attack Backend running on port ${PORT}`));  
