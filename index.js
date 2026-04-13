@@ -109,13 +109,13 @@ app.post('/place-order', async (req, res) => {
       const orderId = orderResult.insertId;
 
       // 3. Insert Items
-      for (const item of items) {
-        const finalId = (item.id && item.id < 1000000) ? item.id : null;
+        for (const item of items) {
+        const finalId = item.id || item.item_id;
         await connection.query(
-          'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
-          [orderId, finalId, item.quantity, item.price]
+            'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
+            [orderId, finalId, item.quantity, item.price]
         );
-      }
+    }
 
       await connection.commit();
       res.json({ success: true, orderId: orderId });
@@ -152,7 +152,10 @@ app.get('/order/:id', async (req, res) => {
     );
 
     const [items] = await pool.query(
-      'SELECT * FROM order_items WHERE order_id = ?',
+      `SELECT oi.*, m.name 
+       FROM order_items oi
+       LEFT JOIN menuitems m ON oi.item_id = m.id
+       WHERE oi.order_id = ?`,
       [req.params.id]
     );
 
