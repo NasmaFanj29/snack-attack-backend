@@ -18,7 +18,7 @@ app.post('/api/admin/login', async (req, res) => {
   const { phone_number, password } = req.body;
   try {
     const [rows] = await pool.query(
-      'SELECT user_id, full_name, phone_number, role FROM users WHERE phone_number = ? AND role IN ("admin", "staff")', 
+      'SELECT user_id, full_name, phone_number FROM users WHERE phone_number = ?', 
       [phone_number]
     );
 
@@ -27,7 +27,7 @@ app.post('/api/admin/login', async (req, res) => {
       if (password === "snack123") { 
         res.json({ 
           success: true, 
-          admin: { id: user.user_id, name: user.full_name, role: user.role } 
+          admin: { id: user.user_id, name: user.full_name } 
         });
       } else {
         res.status(401).json({ success: false, message: "Wrong password" });
@@ -76,12 +76,12 @@ app.post('/place-order', async (req, res) => {
     await connection.beginTransaction();
 
     try {
-      // 1. User Logic
+      // 1. User Logic - ✅ FIXED: Removed 'role' column from INSERT
       let [userRows] = await connection.query('SELECT user_id FROM users WHERE phone_number = ?', [customerPhone]);
       let userId;
       if (userRows.length === 0) {
         const [newUser] = await connection.query(
-          'INSERT INTO users (full_name, phone_number, qlub_balance, role) VALUES (?, ?, 0, "user")',
+          'INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)',
           [customerName, customerPhone]
         );
         userId = newUser.insertId;
@@ -166,8 +166,7 @@ app.put('/admin/orders/:id/status', async (req, res) => {
             'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
             [status, JSON.stringify(payment_splits || []), id]
         );
-        const pointsToEarn = Math.floor(0); // Add logic if needed
-        await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, pointsToEarn]); 
+        await pool.query('CALL UpdateUserQlub(?, ?)', [customer.phone, 0]); 
     } else {
         await pool.query('UPDATE orders SET status = ? WHERE id = ?', [status, id]);
     }
