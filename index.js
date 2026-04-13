@@ -107,14 +107,22 @@ app.post('/place-order', async (req, res) => {
         ]
       );
       const orderId = orderResult.insertId;
-
+      console.log("ITEMS RECEIVED:", items);
       // 3. Insert Items
-        for (const item of items) {
-        const finalId = item.id || item.item_id;
-        await connection.query(
-            'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
-            [orderId, finalId, item.quantity, item.price]
-        );
+      for (const item of items || []) {
+      const itemId = item.id || item.databaseId;
+
+      if (!itemId) continue;
+
+      await connection.query(
+        'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
+        [
+          orderId,
+          itemId,
+          item.quantity || 1,
+          item.price || 0
+        ]
+      );
     }
 
       await connection.commit();
@@ -131,20 +139,22 @@ app.post('/place-order', async (req, res) => {
   }
 });
 
-app.get('/order-status/:id', async (req, res) => {
+/* ✅ Unified Order Route */
+app.get('/orders/:id', async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT status FROM orders WHERE id = ?', [req.params.id]);
-    if (rows.length > 0) {
-      res.json({ status: rows[0].status });
-    } else {
-      res.status(404).json({ message: "Order not found" });
-    }
+    const [order] = await pool.query('SELECT * FROM orders WHERE id = ?', [req.params.id]);
+    const [items] = await pool.query(
+      `SELECT oi.*, m.name FROM order_items oi 
+       LEFT JOIN menuitems m ON oi.item_id = m.id 
+       WHERE oi.order_id = ?`, [req.params.id]
+    );
+    res.json({ order: order[0], items: items }); // ✅ Halla2 el-items ra7 tbayyen
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get('/order/:id', async (req, res) => {
+app.get('/orders/:id', async (req, res) => {
   try {
     const [order] = await pool.query(
       'SELECT * FROM orders WHERE id = ?',
@@ -153,9 +163,9 @@ app.get('/order/:id', async (req, res) => {
 
     const [items] = await pool.query(
       `SELECT oi.*, m.name 
-       FROM order_items oi
-       LEFT JOIN menuitems m ON oi.item_id = m.id
-       WHERE oi.order_id = ?`,
+      FROM order_items oi
+      LEFT JOIN menuitems m ON oi.item_id = m.id
+      WHERE oi.order_id = ?`,
       [req.params.id]
     );
 
