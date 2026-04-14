@@ -172,7 +172,7 @@ app.post('/orders/:id/update-item', async (req, res) => {
   const { action, item } = req.body; // action rah tkoun ya 'add' ya 'remove'
   
   // 💡 Njeeb el ID taba3 el item (metel ma 3melti bl place-order)
-  const itemId = item.id || item.menu_id || item.databaseId;
+  const itemId = item.item_id || item.databaseId || item.id || item.menu_id; 
 
   if (!itemId || isNaN(itemId)) {
     return res.status(400).json({ error: "Invalid item ID" });
