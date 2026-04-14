@@ -140,8 +140,6 @@ if (!itemId || isNaN(itemId)) {
 });
 
 /* ✅ Unified Order Route */
-
-
 app.get('/orders/:id', async (req, res) => {
   try {
     const [order] = await pool.query(
@@ -255,11 +253,11 @@ app.delete("/admin/orders/:id", async (req, res) => {
 
 app.put('/admin/orders/:id/status', async (req, res) => {
   const { id } = req.params;
-  const { status, customer, payment_splits } = req.body; 
+  const { status, customer, payment_splits, replace_splits } = req.body; 
 
   try {
     const [orderRows] = await pool.query(
-      'SELECT total_price, payment_splits FROM orders WHERE id = ?',
+      'SELECT total_price, payment_splits, status FROM orders WHERE id = ?',
       [id]
     );
 
@@ -269,7 +267,7 @@ app.put('/admin/orders/:id/status', async (req, res) => {
 
     const order = orderRows[0];
 
-    // ✅ THE FIX: Safe Parse kirmal ma ya3mel crash!
+    // ✅ Safe Parse kirmal ma ya3mel crash
     let oldSplits = [];
     try {
       if (order.payment_splits) {
@@ -280,18 +278,24 @@ app.put('/admin/orders/:id/status', async (req, res) => {
         oldSplits = Array.isArray(parsed) ? parsed : [];
       }
     } catch (err) {
-      oldSplits = []; // Eza fi error, n5alliha array fadeye
+      oldSplits = [];
     }
 
     const newSplits = payment_splits || [];
-    const allSplits = [...oldSplits, ...newSplits];
+
+    // ✅ replace_splits: true => replace entirely (for real-time payer sync)
+    //    replace_splits: false/undefined => merge (original behavior for admin)
+    const allSplits = replace_splits === true ? newSplits : [...oldSplits, ...newSplits];
+
+    // ✅ Use existing status if none provided (for payer-only sync calls)
+    const finalStatus = status || order.status;
 
     const totalPaid = allSplits.reduce(
       (sum, s) => sum + Number(s.amount || 0),
       0
     );
     
-    if (status === "Paid" && totalPaid < Number(order.total_price)) {
+    if (finalStatus === "Paid" && totalPaid < Number(order.total_price)) {
       return res.status(400).json({
         success: false,
         message: "Payment not complete yet!"
@@ -301,7 +305,7 @@ app.put('/admin/orders/:id/status', async (req, res) => {
     // Update orders
     await pool.query(
       'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
-      [status, JSON.stringify(allSplits), id]
+      [finalStatus, JSON.stringify(allSplits), id]
     );
 
     // Update users
@@ -339,4 +343,4 @@ app.get('/admin/stats', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Snack Attack Backend running on port ${PORT}`));  
+app.listen(PORT, () => console.log(`🚀 Snack Attack Backend running on port ${PORT}`));
