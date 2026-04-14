@@ -38,51 +38,46 @@ io.on("connection", (socket) => {
   });
 
   /* ================= STEP 3.1 FIXED ================= */
-  socket.on("scanJoin", async ({ orderId }) => {
+  /* ================= STEP 3.1 FIXED ================= */
+socket.on("scanJoin", async ({ orderId }) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT payment_splits FROM orders WHERE id = ?",
+      [orderId]
+    );
+
+    if (!rows.length) return;
+
+    let splits = [];
     try {
-      const [rows] = await pool.query(
-        "SELECT payment_splits FROM orders WHERE id = ?",
-        [orderId]
-      );
+      splits = rows[0].payment_splits ? JSON.parse(rows[0].payment_splits) : [];
+    } catch { splits = []; }
 
-      if (!rows.length) return;
+    // Badel ma ncheck el socket.id (yali byetghayar), fine nzid "New Guest" 
+    // aw n5alle el user huwe yzid 7alo. 
+    // Eza badik yeha automatic dghere:
+    const newPayer = {
+      id: Date.now(),
+      deviceId: socket.id, 
+      name: "Guest " + (splits.length + 1), // Kirmal tbayin dghere
+      amount: 0,
+      method: "cash"
+    };
 
-      let splits = [];
-      try {
-        splits = rows[0].payment_splits
-          ? JSON.parse(rows[0].payment_splits)
-          : [];
-      } catch {
-        splits = [];
-      }
+    const updatedSplits = [...splits, newPayer];
 
-      // prevent duplicate device
-      const exists = splits.find(p => p.deviceId === socket.id);
-      if (exists) return;
+    await pool.query(
+      "UPDATE orders SET payment_splits = ? WHERE id = ?",
+      [JSON.stringify(updatedSplits), orderId]
+    );
 
-      const newPayer = {
-        id: Date.now(),
-        deviceId: socket.id,
-        name: "",
-        amount: 0,
-        method: "cash"
-      };
+    // ✅ Emitted to everyone including the person who scanned
+    io.to(orderId).emit("payersUpdated", updatedSplits);
 
-      const updatedSplits = [...splits, newPayer];
-
-      // save DB
-      await pool.query(
-        "UPDATE orders SET payment_splits = ? WHERE id = ?",
-        [JSON.stringify(updatedSplits), orderId]
-      );
-
-      // broadcast to everyone in order
-      io.to(orderId).emit("payersUpdated", updatedSplits);
-
-    } catch (err) {
-      console.error("SCAN ERROR:", err.message);
-    }
-  });
+  } catch (err) {
+    console.error("SCAN ERROR:", err.message);
+  }
+});
 
   socket.on("disconnect", () => {
     console.log("🔴 disconnected:", socket.id);
