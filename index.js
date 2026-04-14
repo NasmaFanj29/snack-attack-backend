@@ -268,17 +268,34 @@ app.put('/admin/orders/:id/status', async (req, res) => {
       [id]
     );
 
-    const order = orderRows[0];
-    const oldSplits = order.payment_splits
-      ? JSON.parse(order.payment_splits)
-      : [];
-    const newSplits = payment_splits || [];
+    if (orderRows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
 
+    const order = orderRows[0];
+
+    // ✅ THE FIX: Safe Parse kirmal ma ya3mel crash!
+    let oldSplits = [];
+    try {
+      if (order.payment_splits) {
+        const parsed = typeof order.payment_splits === 'string'
+          ? JSON.parse(order.payment_splits)
+          : order.payment_splits;
+        
+        oldSplits = Array.isArray(parsed) ? parsed : [];
+      }
+    } catch (err) {
+      oldSplits = []; // Eza fi error, n5alliha array fadeye
+    }
+
+    const newSplits = payment_splits || [];
     const allSplits = [...oldSplits, ...newSplits];
+
     const totalPaid = allSplits.reduce(
       (sum, s) => sum + Number(s.amount || 0),
       0
     );
+    
     if (status === "Paid" && totalPaid < Number(order.total_price)) {
       return res.status(400).json({
         success: false,
@@ -286,23 +303,23 @@ app.put('/admin/orders/:id/status', async (req, res) => {
       });
     }
 
-    // 6. update
+    // Update orders
     await pool.query(
       'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
       [status, JSON.stringify(allSplits), id]
     );
 
-    // 7. update user
+    // Update users
     if (customer && customer.name) {
-      const [rows] = await pool.query(
+      const [userRows] = await pool.query(
         'SELECT user_id FROM orders WHERE id = ?',
         [id]
       );
 
-      if (rows.length > 0) {
+      if (userRows.length > 0 && userRows[0].user_id) {
         await pool.query(
           'UPDATE users SET full_name = ?, phone_number = ? WHERE user_id = ?',
-          [customer.name, customer.phone || "000000", rows[0].user_id]
+          [customer.name, customer.phone || "000000", userRows[0].user_id]
         );
       }
     }
