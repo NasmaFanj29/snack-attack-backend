@@ -2,24 +2,58 @@ const express = require('express');
 const cors = require('cors');
 const pool = require('./db'); 
 const path = require("path");
+
+// 🔥 NEW
+const http = require("http");
+const { Server } = require("socket.io");
+
 const app = express();
 
-// ✅ 1. Middleware: Lezem y-koun bi-awal el-fayl kirmal el-browser ma ya3mel block
+// 🔥 create server بدل app.listen
+const server = http.createServer(app);
+
+// 🔥 socket setup
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+  },
+});
+
+// نخلي io متاح بكل مكان
+app.set("io", io);
+
+/* ================= MIDDLEWARE ================= */
+
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
   credentials: true
 }));
+
 app.use(express.json());
 app.use("/images", express.static(path.join(__dirname, "images")));
-
 
 app.get('/', (req, res) => {
   res.send("Backend is running 🚀");
 });
 
+/* ================= SOCKET CONNECTION ================= */
 
-/* --- 1. AUTHENTICATION --- */
+io.on("connection", (socket) => {
+  console.log("🟢 User connected:", socket.id);
+
+  socket.on("joinOrder", (orderId) => {
+    socket.join(orderId);
+    console.log("📦 Joined order room:", orderId);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("🔴 User disconnected:", socket.id);
+  });
+});
+
+/* ================= AUTH ================= */
+
 app.post('/api/admin/login', async (req, res) => {
   const { phone_number, password } = req.body;
   try {
@@ -46,7 +80,8 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-/* --- 2. MENU & EXTRAS --- */
+/* ================= MENU ================= */
+
 app.get('/menu', async (req, res) => {
   try {
     const [rows] = await pool.query('SELECT * FROM menuitems'); 
@@ -69,11 +104,11 @@ app.get("/item-extras/:id", async (req, res) => {
   }
 });
 
-/* --- 3. ORDER PLACEMENT (Step 1: Requested) --- */
+/* ================= PLACE ORDER ================= */
+
 app.post('/place-order', async (req, res) => {
   const { customer, table_id, total_price, items, payment_splits } = req.body;
-  
-  // Handle missing customer info for 'Requested' initial step
+
   const customerPhone = customer?.phone || "000000";
   const customerName = customer?.name || "Guest";
 
@@ -82,9 +117,13 @@ app.post('/place-order', async (req, res) => {
     await connection.beginTransaction();
 
     try {
-      // 1. User Logic - ✅ FIXED: Removed 'role' column from INSERT
-      let [userRows] = await connection.query('SELECT user_id FROM users WHERE phone_number = ?', [customerPhone]);
+      let [userRows] = await connection.query(
+        'SELECT user_id FROM users WHERE phone_number = ?', 
+        [customerPhone]
+      );
+
       let userId;
+
       if (userRows.length === 0) {
         const [newUser] = await connection.query(
           'INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)',
@@ -95,9 +134,8 @@ app.post('/place-order', async (req, res) => {
         userId = userRows[0].user_id;
       }
 
-      // 2. Insert Order as 'Requested' (Wait for Admin Approval)
       const [orderResult] = await connection.query(
-       'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, ?, ?, ?)',
         [
           table_id || 1,
           total_price,
@@ -106,40 +144,38 @@ app.post('/place-order', async (req, res) => {
           JSON.stringify(payment_splits || [])
         ]
       );
+
       const orderId = orderResult.insertId;
-      console.log("ITEMS RECEIVED:", items);
 
-      // 3. Insert Items
-     for (const item of items || []) {
-    // 💡 Check every possible ID field coming from React
-   const itemId = item.databaseId || item.item_id || item.menu_id || item.id;
+      for (const item of items || []) {
+        const itemId = item.databaseId || item.item_id || item.menu_id || item.id;
 
-if (!itemId || isNaN(itemId)) {
-    console.log("BAD ITEM:", item);
-    continue;
-}
+        if (!itemId || isNaN(itemId)) continue;
 
-    await connection.query(
-        'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
-        [orderId, itemId, item.quantity || 1, item.price || 0]
-    );
-}
+        await connection.query(
+          'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, ?, ?)',
+          [orderId, itemId, item.quantity || 1, item.price || 0]
+        );
+      }
 
       await connection.commit();
-      res.json({ success: true, orderId: orderId });
+
+      res.json({ success: true, orderId });
+
     } catch (err) {
       await connection.rollback();
       throw err;
     } finally {
       connection.release();
     }
+
   } catch (err) {
-    console.error("ORDER ERROR:", err.message); 
     res.status(500).json({ error: err.message });
   }
 });
 
-/* ✅ Unified Order Route */
+/* ================= GET ORDER ================= */
+
 app.get('/orders/:id', async (req, res) => {
   try {
     const [order] = await pool.query(
@@ -149,9 +185,9 @@ app.get('/orders/:id', async (req, res) => {
 
     const [items] = await pool.query(
       `SELECT oi.*, m.name 
-      FROM order_items oi
-      LEFT JOIN menuitems m ON oi.item_id = m.id
-      WHERE oi.order_id = ?`,
+       FROM order_items oi
+       LEFT JOIN menuitems m ON oi.item_id = m.id
+       WHERE oi.order_id = ?`,
       [req.params.id]
     );
 
@@ -159,25 +195,25 @@ app.get('/orders/:id', async (req, res) => {
       order: order[0],
       items
     });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/* --- SHARED CART UPDATES --- */
+/* ================= UPDATE ITEM (🔥 WITH SOCKET BROADCAST) ================= */
+
 app.post('/orders/:id/update-item', async (req, res) => {
   const orderId = req.params.id;
-  const { action, item } = req.body; // action rah tkoun ya 'add' ya 'remove'
-  
-  // 💡 Njeeb el ID taba3 el item (metel ma 3melti bl place-order)
-  const itemId = item.item_id || item.databaseId || item.id || item.menu_id; 
+  const { action, item } = req.body;
+
+  const itemId = item.item_id || item.databaseId || item.id || item.menu_id;
 
   if (!itemId || isNaN(itemId)) {
     return res.status(400).json({ error: "Invalid item ID" });
   }
 
   try {
-    // ✅ FIX 1: Jebna row wa7ed bas (LIMIT 1) w 5adna el ID taba3 l DB row
     const [existingRows] = await pool.query(
       'SELECT id, quantity FROM order_items WHERE order_id = ? AND item_id = ? LIMIT 1',
       [orderId, itemId]
@@ -185,7 +221,6 @@ app.post('/orders/:id/update-item', async (req, res) => {
 
     if (action === 'add') {
       if (existingRows.length > 0) {
-        // ✅ Zidna 1 3a hayda el sater wl ID bel tahdid
         await pool.query(
           'UPDATE order_items SET quantity = quantity + 1 WHERE id = ?',
           [existingRows[0].id]
@@ -198,14 +233,13 @@ app.post('/orders/:id/update-item', async (req, res) => {
       }
     } else if (action === 'remove') {
       if (existingRows.length > 0) {
-        const currentQty = existingRows[0].quantity;
-        if (currentQty > 1) {
-           await pool.query(
+        if (existingRows[0].quantity > 1) {
+          await pool.query(
             'UPDATE order_items SET quantity = quantity - 1 WHERE id = ?',
             [existingRows[0].id]
           );
         } else {
-           await pool.query(
+          await pool.query(
             'DELETE FROM order_items WHERE id = ?',
             [existingRows[0].id]
           );
@@ -217,130 +251,28 @@ app.post('/orders/:id/update-item', async (req, res) => {
       'SELECT SUM(quantity * price_at_time) as newTotal FROM order_items WHERE order_id = ?', 
       [orderId]
     );
+
     const newTotal = sumResult[0].newTotal || 0;
-    await pool.query('UPDATE orders SET total_price = ? WHERE id = ?', [newTotal, orderId]);
+
+    await pool.query(
+      'UPDATE orders SET total_price = ? WHERE id = ?', 
+      [newTotal, orderId]
+    );
+
+    // 🔥🔥🔥 SOCKET BROADCAST
+    io.to(orderId).emit("cartUpdated");
 
     res.json({ success: true, newTotal });
-  } catch (err) {
-    console.error("Shared Cart Update Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
-/* --- 4. ADMIN DASHBOARD --- */
-app.get('/admin/orders', async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT o.id, o.total_price, o.status, o.created_at, o.table_id, o.payment_splits,
-             u.full_name, u.phone_number FROM orders o
-      LEFT JOIN users u ON o.user_id = u.user_id ORDER BY o.created_at DESC`);
-    res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.delete("/admin/orders/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    await pool.query("DELETE FROM order_items WHERE order_id = ?", [id]);
-    const [result] = await pool.query("DELETE FROM orders WHERE id = ?", [id]);
-    res.json({ success: result.affectedRows > 0 });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.put('/admin/orders/:id/status', async (req, res) => {
-  const { id } = req.params;
-  const { status, customer, payment_splits, replace_splits } = req.body; 
-
-  try {
-    const [orderRows] = await pool.query(
-      'SELECT total_price, payment_splits, status FROM orders WHERE id = ?',
-      [id]
-    );
-
-    if (orderRows.length === 0) {
-      return res.status(404).json({ success: false, message: "Order not found" });
-    }
-
-    const order = orderRows[0];
-
-    // ✅ Safe Parse kirmal ma ya3mel crash
-    let oldSplits = [];
-    try {
-      if (order.payment_splits) {
-        const parsed = typeof order.payment_splits === 'string'
-          ? JSON.parse(order.payment_splits)
-          : order.payment_splits;
-        
-        oldSplits = Array.isArray(parsed) ? parsed : [];
-      }
-    } catch (err) {
-      oldSplits = [];
-    }
-
-    const newSplits = payment_splits || [];
-
-    // ✅ replace_splits: true => replace entirely (for real-time payer sync)
-    //    replace_splits: false/undefined => merge (original behavior for admin)
-    const allSplits = replace_splits === true ? newSplits : [...oldSplits, ...newSplits];
-
-    // ✅ Use existing status if none provided (for payer-only sync calls)
-    const finalStatus = status || order.status;
-
-    const totalPaid = allSplits.reduce(
-      (sum, s) => sum + Number(s.amount || 0),
-      0
-    );
-    
-    if (finalStatus === "Paid" && totalPaid < Number(order.total_price)) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment not complete yet!"
-      });
-    }
-
-    // Update orders
-    await pool.query(
-      'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
-      [finalStatus, JSON.stringify(allSplits), id]
-    );
-
-    // Update users
-    if (customer && customer.name) {
-      const [userRows] = await pool.query(
-        'SELECT user_id FROM orders WHERE id = ?',
-        [id]
-      );
-
-      if (userRows.length > 0 && userRows[0].user_id) {
-        await pool.query(
-          'UPDATE users SET full_name = ?, phone_number = ? WHERE user_id = ?',
-          [customer.name, customer.phone || "000000", userRows[0].user_id]
-        );
-      }
-    }
-
-    res.json({ success: true });
-
-  } catch (err) {
-    console.error("UPDATE ERROR:", err.message); 
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get('/admin/stats', async (req, res) => {
-  try {
-    const [rows] = await pool.query(`
-      SELECT COUNT(id) as total_orders, IFNULL(SUM(total_price), 0) as total_sales 
-      FROM orders WHERE DATE(created_at) = CURDATE() AND status != 'Cancelled'`);
-    res.json(rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+/* ================= START SERVER ================= */
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Snack Attack Backend running on port ${PORT}`));
+
+server.listen(PORT, () => {
+  console.log(`🚀 Snack Attack Backend running on port ${PORT}`);
+});
