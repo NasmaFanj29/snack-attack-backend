@@ -179,21 +179,20 @@ app.post('/orders/:id/update-item', async (req, res) => {
   }
 
   try {
-    // 1. Nshouf eza el item aslan mawjoud bhal order
+    // ✅ FIX 1: Jebna row wa7ed bas (LIMIT 1) w 5adna el ID taba3 l DB row
     const [existingRows] = await pool.query(
-      'SELECT * FROM order_items WHERE order_id = ? AND item_id = ?',
+      'SELECT id, quantity FROM order_items WHERE order_id = ? AND item_id = ? LIMIT 1',
       [orderId, itemId]
     );
 
     if (action === 'add') {
       if (existingRows.length > 0) {
-        // Zid el quantity 1
+        // ✅ Zidna 1 3a hayda el sater wl ID bel tahdid
         await pool.query(
-          'UPDATE order_items SET quantity = quantity + 1 WHERE order_id = ? AND item_id = ?',
-          [orderId, itemId]
+          'UPDATE order_items SET quantity = quantity + 1 WHERE id = ?',
+          [existingRows[0].id]
         );
       } else {
-        // Zid el item kello eza mesh mawjoud (law 7ada mna22i shi jdid)
         await pool.query(
           'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, 1, ?)',
           [orderId, itemId, item.price || 0]
@@ -203,28 +202,24 @@ app.post('/orders/:id/update-item', async (req, res) => {
       if (existingRows.length > 0) {
         const currentQty = existingRows[0].quantity;
         if (currentQty > 1) {
-           // Na2es el quantity 1
            await pool.query(
-            'UPDATE order_items SET quantity = quantity - 1 WHERE order_id = ? AND item_id = ?',
-            [orderId, itemId]
+            'UPDATE order_items SET quantity = quantity - 1 WHERE id = ?',
+            [existingRows[0].id]
           );
         } else {
-           // Eza sefr, m7i el item men el order
            await pool.query(
-            'DELETE FROM order_items WHERE order_id = ? AND item_id = ?',
-            [orderId, itemId]
+            'DELETE FROM order_items WHERE id = ?',
+            [existingRows[0].id]
           );
         }
       }
     }
 
-    // 2. E3adet 7isab el total_price taba3 el order la ydal sa7 100%
     const [sumResult] = await pool.query(
       'SELECT SUM(quantity * price_at_time) as newTotal FROM order_items WHERE order_id = ?', 
       [orderId]
     );
     const newTotal = sumResult[0].newTotal || 0;
-    
     await pool.query('UPDATE orders SET total_price = ? WHERE id = ?', [newTotal, orderId]);
 
     res.json({ success: true, newTotal });
