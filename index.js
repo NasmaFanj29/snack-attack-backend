@@ -166,6 +166,74 @@ app.get('/orders/:id', async (req, res) => {
   }
 });
 
+/* --- SHARED CART UPDATES --- */
+app.post('/orders/:id/update-item', async (req, res) => {
+  const orderId = req.params.id;
+  const { action, item } = req.body; // action rah tkoun ya 'add' ya 'remove'
+  
+  // 💡 Njeeb el ID taba3 el item (metel ma 3melti bl place-order)
+  const itemId = item.id || item.menu_id || item.databaseId;
+
+  if (!itemId || isNaN(itemId)) {
+    return res.status(400).json({ error: "Invalid item ID" });
+  }
+
+  try {
+    // 1. Nshouf eza el item aslan mawjoud bhal order
+    const [existingRows] = await pool.query(
+      'SELECT * FROM order_items WHERE order_id = ? AND item_id = ?',
+      [orderId, itemId]
+    );
+
+    if (action === 'add') {
+      if (existingRows.length > 0) {
+        // Zid el quantity 1
+        await pool.query(
+          'UPDATE order_items SET quantity = quantity + 1 WHERE order_id = ? AND item_id = ?',
+          [orderId, itemId]
+        );
+      } else {
+        // Zid el item kello eza mesh mawjoud (law 7ada mna22i shi jdid)
+        await pool.query(
+          'INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, 1, ?)',
+          [orderId, itemId, item.price || 0]
+        );
+      }
+    } else if (action === 'remove') {
+      if (existingRows.length > 0) {
+        const currentQty = existingRows[0].quantity;
+        if (currentQty > 1) {
+           // Na2es el quantity 1
+           await pool.query(
+            'UPDATE order_items SET quantity = quantity - 1 WHERE order_id = ? AND item_id = ?',
+            [orderId, itemId]
+          );
+        } else {
+           // Eza sefr, m7i el item men el order
+           await pool.query(
+            'DELETE FROM order_items WHERE order_id = ? AND item_id = ?',
+            [orderId, itemId]
+          );
+        }
+      }
+    }
+
+    // 2. E3adet 7isab el total_price taba3 el order la ydal sa7 100%
+    const [sumResult] = await pool.query(
+      'SELECT SUM(quantity * price_at_time) as newTotal FROM order_items WHERE order_id = ?', 
+      [orderId]
+    );
+    const newTotal = sumResult[0].newTotal || 0;
+    
+    await pool.query('UPDATE orders SET total_price = ? WHERE id = ?', [newTotal, orderId]);
+
+    res.json({ success: true, newTotal });
+  } catch (err) {
+    console.error("Shared Cart Update Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* --- 4. ADMIN DASHBOARD --- */
 app.get('/admin/orders', async (req, res) => {
   try {
@@ -195,23 +263,52 @@ app.put('/admin/orders/:id/status', async (req, res) => {
   const { status, customer, payment_splits } = req.body; 
 
   try {
-    // 1. Update el status w el payment splits bel awal
-    await pool.query(
-        'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
-        [status, JSON.stringify(payment_splits || []), id]
+    const [orderRows] = await pool.query(
+      'SELECT total_price, payment_splits FROM orders WHERE id = ?',
+      [id]
     );
 
-    // 2. Iza fi customer info, m-n-fatesh 3al user_id w m-n-3mello update
-    if (customer && customer.name) {
-        const [rows] = await pool.query('SELECT user_id FROM orders WHERE id = ?', [id]);
-        if (rows.length > 0) {
-            await pool.query(
-                'UPDATE users SET full_name = ?, phone_number = ? WHERE user_id = ?',
-                [customer.name, customer.phone || "000000", rows[0].user_id]
-            );
-        }
+    const order = orderRows[0];
+    const oldSplits = order.payment_splits
+      ? JSON.parse(order.payment_splits)
+      : [];
+    const newSplits = payment_splits || [];
+
+    const allSplits = [...oldSplits, ...newSplits];
+    const totalPaid = allSplits.reduce(
+      (sum, s) => sum + Number(s.amount || 0),
+      0
+    );
+    if (status === "Paid" && totalPaid < Number(order.total_price)) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment not complete yet!"
+      });
     }
+
+    // 6. update
+    await pool.query(
+      'UPDATE orders SET status = ?, payment_splits = ? WHERE id = ?',
+      [status, JSON.stringify(allSplits), id]
+    );
+
+    // 7. update user
+    if (customer && customer.name) {
+      const [rows] = await pool.query(
+        'SELECT user_id FROM orders WHERE id = ?',
+        [id]
+      );
+
+      if (rows.length > 0) {
+        await pool.query(
+          'UPDATE users SET full_name = ?, phone_number = ? WHERE user_id = ?',
+          [customer.name, customer.phone || "000000", rows[0].user_id]
+        );
+      }
+    }
+
     res.json({ success: true });
+
   } catch (err) {
     console.error("UPDATE ERROR:", err.message); 
     res.status(500).json({ success: false, error: err.message });
