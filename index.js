@@ -1,104 +1,3 @@
-const express = require("express");
-const cors = require("cors");
-const pool = require("./db");
-const path = require("path");
-
-// 🔥 Socket
-const http = require("http");
-const { Server } = require("socket.io");
-
-const app = express();
-const server = http.createServer(app);
-
-const io = new Server(server, {
-  cors: { origin: "*" },
-});
-
-app.set("io", io);
-
-/* ================= MIDDLEWARE ================= */
-
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  credentials: true
-}));
-
-app.use(express.json());
-app.use("/images", express.static(path.join(__dirname, "images")));
-
-/* ================= SOCKET ================= */
-
-io.on("connection", (socket) => {
-  console.log("🟢 connected:", socket.id);
-
-  // join order room
-  socket.on("joinOrder", (orderId) => {
-    socket.join(orderId);
-  });
-
-  /* ================= STEP 3.1 FIXED ================= */
-  /* ================= STEP 3.1 FIXED ================= */
-socket.on("scanJoin", async ({ orderId }) => {
-  try {
-    const [rows] = await pool.query(
-      "SELECT payment_splits FROM orders WHERE id = ?",
-      [orderId]
-    );
-
-    if (!rows.length) return;
-
-    let splits = [];
-    try {
-      splits = rows[0].payment_splits ? JSON.parse(rows[0].payment_splits) : [];
-    } catch { splits = []; }
-
-    // Badel ma ncheck el socket.id (yali byetghayar), fine nzid "New Guest" 
-    // aw n5alle el user huwe yzid 7alo. 
-    // Eza badik yeha automatic dghere:
-    const newPayer = {
-      id: Date.now(),
-      deviceId: socket.id, 
-      name: "Guest " + (splits.length + 1), // Kirmal tbayin dghere
-      amount: 0,
-      method: "cash"
-    };
-
-    const updatedSplits = [...splits, newPayer];
-
-    await pool.query(
-      "UPDATE orders SET payment_splits = ? WHERE id = ?",
-      [JSON.stringify(updatedSplits), orderId]
-    );
-
-    // ✅ Emitted to everyone including the person who scanned
-    io.to(orderId).emit("payersUpdated", updatedSplits);
-
-  } catch (err) {
-    console.error("SCAN ERROR:", err.message);
-  }
-});
-
-  socket.on("disconnect", () => {
-    console.log("🔴 disconnected:", socket.id);
-  });
-});
-
-/* ================= BASIC ROUTES ================= */
-
-app.get("/", (req, res) => {
-  res.send("Backend running 🚀");
-});
-
-/* ================= MENU ================= */
-
-app.get("/menu", async (req, res) => {
-  const [rows] = await pool.query("SELECT * FROM menuitems");
-  res.json(rows);
-});
-
-/* ================= ORDER PLACE ================= */
-
 app.post("/place-order", async (req, res) => {
   const { customer, table_id, total_price, items, payment_splits } = req.body;
 
@@ -147,10 +46,23 @@ app.post("/place-order", async (req, res) => {
 
         if (!itemId) continue;
 
+        // ✅ NEW: Store specialNote and removedExtras
+        const specialNote = item.specialNote || null;
+        const removedExtras = item.removedExtras 
+          ? JSON.stringify(item.removedExtras) 
+          : null;
+
         await conn.query(
-          `INSERT INTO order_items (order_id, item_id, quantity, price_at_time)
-           VALUES (?, ?, ?, ?)`,
-          [orderId, itemId, item.quantity || 1, item.price || 0]
+          `INSERT INTO order_items (order_id, item_id, quantity, price_at_time, special_note, removed_extras)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            orderId, 
+            itemId, 
+            item.quantity || 1, 
+            item.price || 0,
+            specialNote,
+            removedExtras
+          ]
         );
       }
 
@@ -169,7 +81,7 @@ app.post("/place-order", async (req, res) => {
   }
 });
 
-/* ================= GET ORDER ================= */
+/* ================= GET ORDER (Updated) ================= */
 
 app.get("/orders/:id", async (req, res) => {
   const [order] = await pool.query(
@@ -185,10 +97,19 @@ app.get("/orders/:id", async (req, res) => {
     [req.params.id]
   );
 
-  res.json({ order: order[0], items });
+  // ✅ Parse special_note and removed_extras for frontend
+  const parsedItems = items.map(item => ({
+    ...item,
+    special_note: item.special_note || null,
+    removed_extras: item.removed_extras 
+      ? JSON.parse(item.removed_extras) 
+      : null
+  }));
+
+  res.json({ order: order[0], items: parsedItems });
 });
 
-/* ================= UPDATE ITEM + SOCKET ================= */
+/* ================= UPDATE ITEM WITH NOTES ================= */
 
 app.post("/orders/:id/update-item", async (req, res) => {
   const orderId = req.params.id;
@@ -213,9 +134,16 @@ app.post("/orders/:id/update-item", async (req, res) => {
         [existing[0].id]
       );
     } else {
+      // ✅ NEW: Support special_note and removed_extras
+      const specialNote = item.specialNote || null;
+      const removedExtras = item.removedExtras 
+        ? JSON.stringify(item.removedExtras) 
+        : null;
+
       await pool.query(
-        "INSERT INTO order_items (order_id, item_id, quantity, price_at_time) VALUES (?, ?, 1, ?)",
-        [orderId, itemId, item.price || 0]
+        `INSERT INTO order_items (order_id, item_id, quantity, price_at_time, special_note, removed_extras) 
+         VALUES (?, ?, 1, ?, ?, ?)`,
+        [orderId, itemId, item.price || 0, specialNote, removedExtras]
       );
     }
   }
@@ -247,14 +175,44 @@ app.post("/orders/:id/update-item", async (req, res) => {
   );
 
   // 🔥 REALTIME UPDATE
-  io.to(orderId).emit("cartUpdated");
+  io.to(String(orderId)).emit("cartUpdated");
 
   res.json({ success: true, newTotal });
 });
 
-/* ================= START ================= */
+/* ================= ADMIN DASHBOARD (Display Notes) ================= */
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () =>
-  console.log("🚀 running on", PORT)
-);
+app.get("/admin/orders", async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT o.id, o.total_price, o.status, o.created_at, o.table_id, o.payment_splits,
+             u.full_name, u.phone_number FROM orders o
+      LEFT JOIN users u ON o.user_id = u.user_id ORDER BY o.created_at DESC`);
+    
+    // ✅ Enhance with items including notes
+    const enrichedRows = await Promise.all(
+      rows.map(async (order) => {
+        const [items] = await pool.query(
+          `SELECT oi.*, m.name FROM order_items oi
+           LEFT JOIN menuitems m ON oi.item_id = m.id
+           WHERE oi.order_id = ?`,
+          [order.id]
+        );
+        
+        const parsedItems = items.map(item => ({
+          ...item,
+          special_note: item.special_note || null,
+          removed_extras: item.removed_extras 
+            ? JSON.parse(item.removed_extras) 
+            : null
+        }));
+
+        return { ...order, items: parsedItems };
+      })
+    );
+
+    res.json(enrichedRows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
