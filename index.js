@@ -288,7 +288,7 @@ app.post('/api/chat', async (req, res) => {
     // 2. Call Groq SDK
     const chatCompletion = await groq.chat.completions.create({
       messages: formattedMessages,
-      model: "llama3-8b-8192", // Fast Llama 3 model
+      model: "llama-3.1-8b-instant", // Fast Llama 3 model
       temperature: 0.75,
       max_tokens: 400,
     });
