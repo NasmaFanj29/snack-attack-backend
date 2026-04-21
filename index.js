@@ -218,12 +218,12 @@ app.get("/orders/:id", async (req, res) => {
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 // ═══════════════════════════════════════════════════════════════════
-//  /api/chat  —  Gemini 1.5 Flash endpoint
+//  /api/chat  —  Gemma 3 (27B) endpoint
 //  ENV variable required on Render:
 //    GEMINI_API_KEY = AIza...
 // ═══════════════════════════════════════════════════════════════════
 
-const GEMINI_MODEL = 'gemini-1.5-flash'; 
+const GEMINI_MODEL = 'gemma-3-27b-it'; 
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 const SYSTEM_PROMPT = `You are "Sami", a professional, polite, and helpful AI assistant for Snack Attack restaurant.
@@ -297,11 +297,12 @@ app.post('/api/chat', async (req, res) => {
       return res.status(400).json({ error: 'Conversation empty after cleaning' });
     }
 
+    // 🛑 FIX FOR GEMMA: Inject the System Prompt into the first user message 
+    // because Gemma models do not support the "systemInstruction" field natively.
+    contents[0].parts[0].text = "SYSTEM INSTRUCTIONS: " + SYSTEM_PROMPT + "\n\nUSER MESSAGE: " + contents[0].parts[0].text;
+
     const body = {
       contents,
-      systemInstruction: {
-        parts: [{ text: SYSTEM_PROMPT }],
-      },
       generationConfig: {
         temperature: 0.7,
         maxOutputTokens: 400,
