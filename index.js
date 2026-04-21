@@ -219,11 +219,11 @@ app.get("/orders/:id", async (req, res) => {
 
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
-// ── FINAL FIX: Use Stable v1 API ───────────────────────────────────────
+// ── FINAL FIX ───────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
-// 1. Use v1 (Stable) instead of v1beta
-// 2. Use "gemini-1.5-flash-latest" alias to ensure it finds the model
-const MODEL_ID = "gemini-1.5-flash-latest"; 
+
+// ✅ FIX: Use "gemini-1.5-flash" (without -latest) for v1 API
+const MODEL_ID = "gemini-1.5-flash"; 
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
@@ -231,8 +231,10 @@ app.post("/api/chat", async (req, res) => {
 
   if (!messages) return res.status(400).json({ error: "No messages" });
 
+  // Safety check for missing key
   if (!GEMINI_API_KEY) {
-    return res.status(500).json({ error: "Server missing API Key" });
+    console.error("❌ ERROR: GEMINI_API_KEY is missing in Render Environment Variables!");
+    return res.status(500).json({ error: "Server configuration error" });
   }
 
   try {
@@ -241,13 +243,13 @@ Keep replies SHORT. Use emojis. Understand Lebanese Arabizi (bde, kifak).
 MENU: Classic Smash Burger $9.99, Crispy Chicken $10.99.
 Add item: CART_ADD:Name. Custom: CUSTOM_ORDER:json`;
 
-    // 1. Map roles (assistant -> model)
+    // 1. Map roles
     let history = messages.map(msg => ({
       role: msg.role === "assistant" ? "model" : "user",
       parts: [{ text: msg.content }]
     }));
 
-    // 2. CRITICAL: Fix Alternating Roles (Merge consecutive same roles)
+    // 2. Fix Alternating Roles (Merge consecutive messages)
     const fixedHistory = [];
     for (const msg of history) {
       const last = fixedHistory[fixedHistory.length - 1];
@@ -258,11 +260,10 @@ Add item: CART_ADD:Name. Custom: CUSTOM_ORDER:json`;
       }
     }
 
-    // 3. Inject System Prompt into first User message (Safe for v1)
+    // 3. Inject System Prompt into first User message
     if (fixedHistory.length > 0 && fixedHistory[0].role === 'user') {
         fixedHistory[0].parts[0].text = `${systemPrompt}\n\nUser: ${fixedHistory[0].parts[0].text}`;
     } else {
-        // If empty or starts with model, insert system prompt as new user message
         fixedHistory.unshift({ role: 'user', parts: [{ text: systemPrompt }] });
     }
 
@@ -271,7 +272,7 @@ Add item: CART_ADD:Name. Custom: CUSTOM_ORDER:json`;
       generationConfig: { temperature: 0.7 }
     };
 
-    console.log("📤 Sending to Gemini v1...");
+    console.log("📤 Sending to Gemini v1 (Stable)...");
     const response = await fetch(GEMINI_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -289,7 +290,7 @@ Add item: CART_ADD:Name. Custom: CUSTOM_ORDER:json`;
     res.json({ reply: reply || "Sorry, no response." });
 
   } catch (err) {
-    console.error("❌ Crash:", err);
+    console.error("❌ Server Crash:", err);
     res.status(500).json({ error: err.message });
   }
 });
