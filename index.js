@@ -219,56 +219,59 @@ app.get("/orders/:id", async (req, res) => {
 
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
-// ── CHAT ENDPOINT (ULTIMATE FIX) ───────────────────────────────────────
+// ── FINAL FIX: Use Stable v1 API ───────────────────────────────────────
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
-const MODEL_ID = "gemini-1.5-flash";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
+// 1. Use v1 (Stable) instead of v1beta
+// 2. Use "gemini-1.5-flash-latest" alias to ensure it finds the model
+const MODEL_ID = "gemini-1.5-flash-latest"; 
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;
 
-  if (!messages) {
-    return res.status(400).json({ error: "No messages" });
-  }
+  if (!messages) return res.status(400).json({ error: "No messages" });
 
-  // ⚠️ CHECK IF KEY EXISTS
   if (!GEMINI_API_KEY) {
-    console.error("❌ FATAL: GEMINI_API_KEY is NOT set in Render Environment Variables!");
     return res.status(500).json({ error: "Server missing API Key" });
   }
 
   try {
-    const systemPrompt = `You are a friendly AI for Snack Attack restaurant.
-Keep replies SHORT. Use emojis. Understand Arabizi (Lebanese chat).
+    const systemPrompt = `You are a friendly AI for Snack Attack burger place.
+Keep replies SHORT. Use emojis. Understand Lebanese Arabizi (bde, kifak).
 MENU: Classic Smash Burger $9.99, Crispy Chicken $10.99.
-Add item: CART_ADD:Name
-Custom order: CUSTOM_ORDER:json`;
+Add item: CART_ADD:Name. Custom: CUSTOM_ORDER:json`;
 
-    // 1. Map roles
+    // 1. Map roles (assistant -> model)
     let history = messages.map(msg => ({
       role: msg.role === "assistant" ? "model" : "user",
       parts: [{ text: msg.content }]
     }));
 
-    // 2. CRITICAL FIX: Force Alternating Roles
-    // If two messages have same role, merge them. This prevents 400 errors.
+    // 2. CRITICAL: Fix Alternating Roles (Merge consecutive same roles)
     const fixedHistory = [];
     for (const msg of history) {
       const last = fixedHistory[fixedHistory.length - 1];
       if (last && last.role === msg.role) {
-        last.parts[0].text += `\n${msg.parts[0].text}`; // Merge text
+        last.parts[0].text += `\n${msg.parts[0].text}`;
       } else {
         fixedHistory.push(msg);
       }
     }
 
+    // 3. Inject System Prompt into first User message (Safe for v1)
+    if (fixedHistory.length > 0 && fixedHistory[0].role === 'user') {
+        fixedHistory[0].parts[0].text = `${systemPrompt}\n\nUser: ${fixedHistory[0].parts[0].text}`;
+    } else {
+        // If empty or starts with model, insert system prompt as new user message
+        fixedHistory.unshift({ role: 'user', parts: [{ text: systemPrompt }] });
+    }
+
     const requestBody = {
       contents: fixedHistory,
-      systemInstruction: { parts: [{ text: systemPrompt }] },
       generationConfig: { temperature: 0.7 }
     };
 
-    console.log("📤 Sending to Gemini...");
+    console.log("📤 Sending to Gemini v1...");
     const response = await fetch(GEMINI_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -283,7 +286,7 @@ Custom order: CUSTOM_ORDER:json`;
     }
 
     const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ reply: reply || "Sorry, I couldn't generate a response." });
+    res.json({ reply: reply || "Sorry, no response." });
 
   } catch (err) {
     console.error("❌ Crash:", err);
