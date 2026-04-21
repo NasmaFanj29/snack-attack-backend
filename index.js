@@ -215,82 +215,136 @@ app.get("/orders/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ... (Keep top part: imports, place-order, admin routes) ...
-
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
-// ── FINAL FIX ───────────────────────────────────────
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
+// ═══════════════════════════════════════════════════════════════════
+//  /api/chat  —  Gemini 2.0 Flash endpoint
+//  Replace the existing app.post("/api/chat", ...) in server.js
+//  with this entire block.
+//
+//  ENV variable required on Render:
+//    GEMINI_API_KEY = AIza...
+// ═══════════════════════════════════════════════════════════════════
 
-// ✅ FIX: Use "gemini-1.5-flash" (without -latest) for v1 API
-const MODEL_ID = "gemini-1.5-flash"; 
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+const SYSTEM_PROMPT = `You are "Sami", a friendly AI assistant for Snack Attack restaurant.
 
-app.post("/api/chat", async (req, res) => {
+PERSONALITY:
+- Warm, fun, uses emojis naturally
+- Understands Lebanese Arabizi: bde = I want, shu = what, kifak = how are you,
+  la2 = no, aywa/ee = yes, ktir = very, mnee7 = good, habibi = my friend,
+  yalla = let's go, tayeb = okay, eza = if, maa = with
+- Keep replies SHORT and punchy (2-4 sentences max)
+- Never say "I'm an AI" — just be Sami
+
+MENU (use these exact names):
+- Classic Smash Burger — $9.99
+- Crispy Chicken Sandwich — $10.99
+- Double Smash — $12.99
+- Fries — $3.99
+- Onion Rings — $4.49
+- Milkshake — $5.99
+
+ACTIONS (append to your reply when needed):
+1. Add to cart:         CART_ADD:Item Name
+2. Custom burger order: CUSTOM_ORDER:{"bread":"brioche","protein":"beef","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special","notes":""}
+   - bread options: brioche, sesame, sourdough
+   - protein: beef, chicken, veggie
+   - cheese: cheddar, american, none
+   - sauce: special, bbq, mayo, none
+3. Escalate to staff:   NEED_ADMIN:reason
+   - reasons: confused | complaint | offensive | help
+
+RULES:
+- Only use CART_ADD when customer clearly wants to order something
+- Only use CUSTOM_ORDER when they describe a custom/build-your-own burger
+- Only use NEED_ADMIN if you truly can't help or they ask for a human
+- Never add multiple CART_ADD lines — one per message
+- Never make up menu items not listed above`;
+
+app.post('/api/chat', async (req, res) => {
   const { messages } = req.body;
 
-  if (!messages) return res.status(400).json({ error: "No messages" });
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: 'messages array required' });
+  }
 
-  // Safety check for missing key
-  if (!GEMINI_API_KEY) {
-    console.error("❌ ERROR: GEMINI_API_KEY is missing in Render Environment Variables!");
-    return res.status(500).json({ error: "Server configuration error" });
+  if (!process.env.GEMINI_API_KEY) {
+    console.error('❌ GEMINI_API_KEY missing from environment!');
+    return res.status(500).json({ error: 'Server configuration error — API key missing' });
   }
 
   try {
-    const systemPrompt = `You are a friendly AI for Snack Attack burger place.
-Keep replies SHORT. Use emojis. Understand Lebanese Arabizi (bde, kifak).
-MENU: Classic Smash Burger $9.99, Crispy Chicken $10.99.
-Add item: CART_ADD:Name. Custom: CUSTOM_ORDER:json`;
-
-    // 1. Map roles
-    let history = messages.map(msg => ({
-      role: msg.role === "assistant" ? "model" : "user",
-      parts: [{ text: msg.content }]
+    // 1. Map roles: 'assistant' → 'model'
+    // 🛑 FIX: Add a fallback space so Gemini never gets an empty string
+    const mapped = messages.map((m) => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content || ' ' }], 
     }));
 
-    // 2. Fix Alternating Roles (Merge consecutive messages)
-    const fixedHistory = [];
-    for (const msg of history) {
-      const last = fixedHistory[fixedHistory.length - 1];
+    // 2. Merge consecutive same-role messages (Gemini requires alternating)
+    const contents = [];
+    for (const msg of mapped) {
+      const last = contents[contents.length - 1];
       if (last && last.role === msg.role) {
-        last.parts[0].text += `\n${msg.parts[0].text}`;
+        last.parts[0].text += '\n' + msg.parts[0].text;
       } else {
-        fixedHistory.push(msg);
+        contents.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
       }
     }
 
-    // 3. Inject System Prompt into first User message
-    if (fixedHistory.length > 0 && fixedHistory[0].role === 'user') {
-        fixedHistory[0].parts[0].text = `${systemPrompt}\n\nUser: ${fixedHistory[0].parts[0].text}`;
-    } else {
-        fixedHistory.unshift({ role: 'user', parts: [{ text: systemPrompt }] });
+    // 3. Must start with 'user' role
+    // 🛑 FIX: Instead of throwing an error, just remove the bot's first message!
+    while (contents.length > 0 && contents[0].role !== 'user') {
+      contents.shift(); 
     }
 
-    const requestBody = {
-      contents: fixedHistory,
-      generationConfig: { temperature: 0.7 }
+    if (contents.length === 0) {
+      return res.status(400).json({ error: 'Conversation empty after cleaning' });
+    }
+
+    const body = {
+      contents,
+      systemInstruction: {
+        parts: [{ text: SYSTEM_PROMPT }],
+      },
+      generationConfig: {
+        temperature: 0.75,
+        maxOutputTokens: 400,
+      },
     };
 
-    console.log("📤 Sending to Gemini v1 (Stable)...");
-    const response = await fetch(GEMINI_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
+    console.log(`📤 Gemini request — ${contents.length} messages`);
+
+    const response = await fetch(GEMINI_URL(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
 
     const data = await response.json();
-    
+
     if (!response.ok) {
-      console.error("❌ Gemini Error:", JSON.stringify(data));
-      return res.status(500).json({ error: "Gemini Error", details: data });
+      console.error('❌ Gemini API Error:', JSON.stringify(data, null, 2));
+      return res.status(500).json({
+        error: 'Gemini API error',
+        details: data?.error?.message || data,
+      });
     }
 
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    res.json({ reply: reply || "Sorry, no response." });
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!reply) {
+      console.warn('⚠️ Gemini returned empty reply:', JSON.stringify(data));
+      return res.status(500).json({ error: 'Empty response from Gemini' });
+    }
+
+    console.log(`✅ Gemini reply (${reply.length} chars)`);
+    res.json({ reply });
 
   } catch (err) {
-    console.error("❌ Server Crash:", err);
+    console.error('❌ /api/chat crash:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
