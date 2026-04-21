@@ -6,7 +6,7 @@ const pool = require('./db');
 
 const app = express();
 app.use(cors());
-app.use(express.json());  // ← CRITICAL - enables JSON parsing
+app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -26,7 +26,6 @@ app.post("/place-order", async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // 1. User Handling
     let [userRows] = await conn.query("SELECT user_id FROM users WHERE phone_number = ?", [phone]);
     let userId;
     if (!userRows.length) {
@@ -36,35 +35,48 @@ app.post("/place-order", async (req, res) => {
       userId = userRows[0].user_id;
     }
 
-    // 2. Insert Order
     const [order] = await conn.query(
       `INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, 'Requested', ?, ?)`,
       [table_id || 1, total_price, userId, JSON.stringify(payment_splits || [])]
     );
     const orderId = order.insertId;
 
-    // 3. Insert Items (Smart Logic)
     let savedCount = 0;
-    
+
     for (const item of items || []) {
-      // أ. محاولة جلب ID من الفرونت إند
       let itemId = item.databaseId || item.item_id || item.menu_id || item.id || null;
 
-      // ب. حل سحري: إذا ID مش موجود، ندور عليه بالقاعدة عن طريق الاسم
       if (!itemId && item.name) {
-         const [menuRows] = await conn.query("SELECT id FROM menuitems WHERE name = ? LIMIT 1", [item.name]);
-         if (menuRows.length) {
-           itemId = menuRows[0].id;
-           console.log(`🔍 Found ID for "${item.name}": ${itemId}`);
-         }
+        const [menuRows] = await conn.query("SELECT id FROM menuitems WHERE name = ? LIMIT 1", [item.name]);
+        if (menuRows.length) {
+          itemId = menuRows[0].id;
+          console.log(`🔍 Found ID for "${item.name}": ${itemId}`);
+        }
       }
 
-      if (!itemId) {
-        console.warn(`⚠️ SKIPPED "${item.name}" — no ID found in DB or Request`);
+      // Handle custom burger orders (no DB item ID)
+      if (!itemId && item.isCustom) {
+        console.log(`🍔 Custom order: "${item.name}" — saving with null item_id`);
+        const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
+        const specialNote = item.customOrderData
+          ? `Custom: ${JSON.stringify(item.customOrderData)}`
+          : item.specialNote || null;
+
+        await conn.query(
+          `INSERT INTO order_items 
+            (order_id, item_id, quantity, price_at_time, special_note, removed_extras, selected_extras)
+           VALUES (?, NULL, ?, ?, ?, NULL, ?)`,
+          [orderId, item.quantity || 1, item.price || 12.99, specialNote, selectedExtras]
+        );
+        savedCount++;
         continue;
       }
 
-      // ج. تجهيز البيانات
+      if (!itemId) {
+        console.warn(`⚠️ SKIPPED "${item.name}" — no ID found`);
+        continue;
+      }
+
       const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
       const removedExtras = item.removedExtras ? JSON.stringify(item.removedExtras) : null;
       const specialNote = item.specialNote || null;
@@ -91,91 +103,56 @@ app.post("/place-order", async (req, res) => {
   }
 });
 
-/* ================= ADMIN DASHBOARD (Debugged) ================= */
-// ✅ REPLACE the /admin/orders endpoint in server.js with this:
-
+/* ================= ADMIN DASHBOARD ================= */
 app.get("/admin/orders", async (req, res) => {
   try {
-    console.log("📦 Fetching all orders...");
-    
-    // 1. Fetch Orders
     const [orders] = await pool.query(`
       SELECT 
-        o.id, 
-        o.total_price, 
-        o.status, 
-        o.created_at, 
-        o.table_id, 
-        o.payment_splits,
-        u.full_name, 
-        u.phone_number 
+        o.id, o.total_price, o.status, o.created_at, o.table_id, o.payment_splits,
+        u.full_name, u.phone_number 
       FROM orders o
       LEFT JOIN users u ON o.user_id = u.user_id 
       ORDER BY o.created_at DESC
     `);
 
-    if (orders.length === 0) {
-      console.log("ℹ️ No orders found");
-      return res.json([]);
-    }
+    if (orders.length === 0) return res.json([]);
 
-    console.log(`📋 Found ${orders.length} orders`);
-
-    // 2. Fetch ALL Items for ALL orders in ONE query
     const orderIds = orders.map(o => o.id);
-    
+
     let [allItems] = await pool.query(`
       SELECT 
-        oi.id,
-        oi.order_id, 
-        oi.item_id, 
-        oi.quantity, 
-        oi.price_at_time,
-        oi.special_note,
-        oi.removed_extras,
-        oi.selected_extras,
-        m.name,
-        m.image,
-        m.description
+        oi.id, oi.order_id, oi.item_id, oi.quantity, oi.price_at_time,
+        oi.special_note, oi.removed_extras, oi.selected_extras,
+        m.name, m.image, m.description
       FROM order_items oi
       LEFT JOIN menuitems m ON oi.item_id = m.id
       WHERE oi.order_id IN (${orderIds.map(() => '?').join(',')})
       ORDER BY oi.order_id, oi.id
     `, orderIds);
 
-    console.log(`🔍 Found ${allItems.length} items total across all orders`);
-
-    // 3. Map items and parse JSON fields
     const itemsMap = {};
-    
     (allItems || []).forEach(item => {
       const parsed = {
         id: item.id,
         item_id: item.item_id,
         order_id: item.order_id,
-        name: item.name || `Item #${item.item_id}`,
+        name: item.name || (item.special_note?.startsWith('Custom:') ? 'Custom Burger' : `Item #${item.item_id}`),
         image: item.image,
         description: item.description,
         quantity: item.quantity || 1,
         price_at_time: item.price_at_time || 0,
         special_note: item.special_note || null,
-        selected_extras: item.selected_extras 
-          ? (typeof item.selected_extras === 'string' 
-              ? JSON.parse(item.selected_extras) 
-              : item.selected_extras)
+        selected_extras: item.selected_extras
+          ? (typeof item.selected_extras === 'string' ? JSON.parse(item.selected_extras) : item.selected_extras)
           : [],
-        removed_extras: item.removed_extras 
-          ? (typeof item.removed_extras === 'string' 
-              ? JSON.parse(item.removed_extras) 
-              : item.removed_extras)
-          : []
+        removed_extras: item.removed_extras
+          ? (typeof item.removed_extras === 'string' ? JSON.parse(item.removed_extras) : item.removed_extras)
+          : [],
       };
-      
       if (!itemsMap[item.order_id]) itemsMap[item.order_id] = [];
       itemsMap[item.order_id].push(parsed);
     });
 
-    // 4. Combine orders with their items
     const result = orders.map(order => ({
       id: order.id,
       table_id: order.table_id,
@@ -185,12 +162,10 @@ app.get("/admin/orders", async (req, res) => {
       payment_splits: order.payment_splits,
       full_name: order.full_name || 'Guest',
       phone_number: order.phone_number,
-      // ✅ Include items in multiple formats for compatibility
       items: itemsMap[order.id] || [],
-      order_items: itemsMap[order.id] || []  // Backup name
+      order_items: itemsMap[order.id] || [],
     }));
 
-    console.log(`✅ Returning ${result.length} orders with items`);
     res.json(result);
 
   } catch (err) {
@@ -218,12 +193,10 @@ app.get("/orders/:id", async (req, res) => {
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 // ═══════════════════════════════════════════════════════════════════
-//  /api/chat  —  Gemma 3 (27B) endpoint - DYNAMIC MENU
-//  ENV variable required on Render:
-//    GEMINI_API_KEY = AIza...
+//  /api/chat  —  Gemma 3 (27B)
 // ═══════════════════════════════════════════════════════════════════
 
-const GEMINI_MODEL = 'gemma-3-27b-it'; 
+const GEMINI_MODEL = 'gemma-3-27b-it';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 app.post('/api/chat', async (req, res) => {
@@ -238,7 +211,7 @@ app.post('/api/chat', async (req, res) => {
     return res.status(500).json({ error: 'Server configuration error — API key missing' });
   }
 
-  // 1. DYNAMIC MENU GENERATION
+  // ── Build dynamic menu list ──────────────────────────────────
   let menuList = "AVAILABLE MENU ITEMS:\n";
   if (menuItems && menuItems.length > 0) {
     menuItems.forEach(item => {
@@ -248,39 +221,57 @@ app.post('/api/chat', async (req, res) => {
     menuList += "Menu is currently unavailable.\n";
   }
 
-  // 2. DYNAMIC PROMPT (PROFESSIONAL & NO EMOJI)
-  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", a professional, formal, and polite assistant for Snack Attack restaurant.
+  // ── System Prompt ────────────────────────────────────────────
+  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", the friendly and helpful assistant at Snack Attack restaurant.
 
 PERSONALITY & TONE:
-- Strictly professional, formal, and highly respectful.
-- You perfectly understand Lebanese Arabizi (e.g., bde = I want, shu = what, kifak = how are you).
-- You must reply in clear, professional English.
-- ABSOLUTELY NO EMOJIS. Do not use a single emoji in your responses under any circumstances.
-- ABSOLUTELY NO SLANG. Do not use words like "habibi", "ya kbir", "bro", "yalla", "wallah".
-- Keep replies concise, clear, and direct (1-3 sentences max).
-- Never state that you are an AI.
+- Warm, friendly, and genuinely helpful — like a knowledgeable friend who works at the restaurant.
+- Keep replies short and conversational (1-3 sentences). Never write long paragraphs.
+- You understand Lebanese Arabizi perfectly. Examples: "bde" = I want, "shu" = what, "ma3i" = with me, "kifak" = how are you, "marhaba" = hello, "ktir" = very, "3ajib" = amazing, "eza" = if, "hek" = like this, "yih" = wow, "bas" = just/only, "la2" = no, "na3am" = yes, "haida" = this, "chou" = what, "mni7" = good.
+- Always reply in clear, natural English regardless of what language the customer writes in.
+- ABSOLUTELY NO EMOJIS. Not a single one, ever.
+- ABSOLUTELY NO SLANG OR FILLER WORDS. No "habibi", "bro", "yo", "yalla", "wallah", "khalas", "3anjad", "chi kamen", or any similar expressions.
+- Never refer to yourself as an AI or a bot.
+- Be solution-focused: always try to help before asking clarifying questions.
+
+RESTAURANT INFORMATION:
+- Name: Snack Attack
+- Hours: Open every day, 11:00 AM to 11:00 PM
+- Specialty: Burgers, custom build-your-own burgers, snacks
 
 ${menuList}
 
-ACTIONS (append to your reply when needed):
-1. Add to cart:         CART_ADD:Item Name
-2. Custom burger order: CUSTOM_ORDER:{"bread":"brioche","protein":"beef","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special","notes":""}
-3. Escalate to staff:   NEED_ADMIN:reason
+ACTIONS — append silently at the end of your reply when needed:
 
-RULES:
-- Only use CART_ADD when customer clearly wants to order something from the AVAILABLE MENU ITEMS above.
-- Only use CUSTOM_ORDER when they describe a custom/build-your-own burger.
-- TRY TO HELP THE CUSTOMER YOURSELF FIRST. 
-- ONLY use NEED_ADMIN if the user EXPLICITLY asks for a "human", "waiter", "staff", or "manager".
-- Never add multiple CART_ADD lines — one per message.
-- Never make up menu items not listed in the menu above.`;
+1. Add a menu item to cart:
+   CART_ADD:Exact Item Name
+   (Use ONLY for items listed in AVAILABLE MENU ITEMS above)
+
+2. Place a custom burger order:
+   CUSTOM_ORDER:{"bread":"brioche","protein":"beef patty","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special sauce","notes":"","price":12.99}
+   (Use ONLY when customer has described all parts of their custom burger)
+
+3. Connect customer to staff:
+   NEED_ADMIN:reason
+   Reason options: request (asked for human/waiter/staff), complaint (food or service issue), offensive (rude language)
+   (Use ONLY when customer explicitly asks for a person, or has a serious complaint)
+
+IMPORTANT RULES:
+- Never invent or suggest items not listed in AVAILABLE MENU ITEMS.
+- For custom burgers, collect all details first (bread, protein, cheese, veggies, sauce) before using CUSTOM_ORDER.
+  If any detail is missing, ask for it first.
+- One CART_ADD per message maximum.
+- Never combine CART_ADD and CUSTOM_ORDER in the same response.
+- Do not explain or mention the action tags to the customer — they are invisible backend signals.
+- If the customer seems confused or unhappy, try to resolve it yourself before escalating.`;
 
   try {
     const mapped = messages.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content || ' ' }], 
+      parts: [{ text: m.content || ' ' }],
     }));
 
+    // Merge consecutive same-role messages (Gemma requirement)
     const contents = [];
     for (const msg of mapped) {
       const last = contents[contents.length - 1];
@@ -291,21 +282,26 @@ RULES:
       }
     }
 
+    // Must start with user role
     while (contents.length > 0 && contents[0].role !== 'user') {
-      contents.shift(); 
+      contents.shift();
     }
 
     if (contents.length === 0) {
       return res.status(400).json({ error: 'Conversation empty after cleaning' });
     }
 
-    // 🛑 FIX FOR GEMMA: Inject the System Prompt into the first user message 
-    contents[0].parts[0].text = "SYSTEM INSTRUCTIONS: " + DYNAMIC_SYSTEM_PROMPT + "\n\nUSER MESSAGE: " + contents[0].parts[0].text;
+    // Inject system prompt into first user message (Gemma has no system role)
+    contents[0].parts[0].text =
+      "SYSTEM INSTRUCTIONS:\n" +
+      DYNAMIC_SYSTEM_PROMPT +
+      "\n\n---\nCUSTOMER MESSAGE: " +
+      contents[0].parts[0].text;
 
     const body = {
       contents,
       generationConfig: {
-        temperature: 0.5,
+        temperature: 0.6,
         maxOutputTokens: 400,
       },
     };
@@ -341,4 +337,4 @@ RULES:
 });
 
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
