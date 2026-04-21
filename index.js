@@ -217,9 +217,11 @@ app.get("/orders/:id", async (req, res) => {
 
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
-/* ── FIXED GEMINI CHAT ENDPOINT ────────────────────────────────── */
-const GEMINI_API_KEY = "AIzaSyB7S_U0TSZNFRU4wbv3gTXs43Bu5VqJ7Ko";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCL8Yaulhn6U8XP_YjoJOMY-a6UT_W2fJo"; 
+const MODEL_ID = "gemini-1.5-flash"; // Most stable model
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;
@@ -228,95 +230,81 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: "Invalid messages format" });
   }
 
-  console.log("💬 Chat request received with", messages.length, "messages");
+  // Basic check for missing key
+  if (!GEMINI_API_KEY || GEMINI_API_KEY === "YOUR_NEW_API_KEY_HERE") {
+    console.error("❌ CRITICAL: Gemini API Key is missing in server.js!");
+    return res.status(500).json({ error: "Server misconfigured: Missing API Key" });
+  }
 
   try {
-    // System prompt
     const systemPrompt = `You are a friendly AI assistant for "Snack Attack," a burger & sandwich restaurant.
 Keep replies SHORT (max 3-4 sentences). Use food emojis naturally 🍔🍟.
 
 CRITICAL RULE: Understand Lebanese Franco-Arabic (Arabizi) like "bde", "kifak", "shou", "3m", "toum", "yalla".
 Reply in friendly Lebanese Arabizi OR English. NEVER use Arabic script.
 
-════ MENU ════
+MENU:
 - Classic Smash Burger $9.99
 - Crispy Chicken Sandwich $10.99
 - BBQ Bacon Stack $12.99
 - Veggie Delight $9.49
 - Loaded Fries $5.99
-- Oreo Milkshake $6.99
-- Strawberry Lemonade $4.99
 
-════ ADD TO CART ════
-If customer wants to add an item, output on a new line EXACTLY:
-CART_ADD:Classic Smash Burger
+If customer wants to add an item, output on a new line: CART_ADD:Item Name
+If custom burger, collect details then output: CUSTOM_ORDER:{"bread":"...","protein":"..."}
+If stuck, output: NEED_ADMIN:reason`;
 
-════ CUSTOM BURGER FLOW ════
-Collect: 1. Bread 2. Protein 3. Cheese 4. Veggies 5. Sauce 6. Notes
-When ALL confirmed, say "Perfect! Sending your custom order! 🍔✨" then:
-CUSTOM_ORDER:{"bread":"...","protein":"...","cheese":"...","veggies":"...","sauce":"...","notes":"..."}
+    // 1. Clean history
+    const cleanHistory = messages.map(msg => ({
+      role: msg.role === "assistant" ? "model" : "user",
+      parts: [{ text: msg.content }]
+    }));
 
-════ ESCALATION ════
-After 2 failed attempts → NEED_ADMIN:confused
-Rude → NEED_ADMIN:offensive
-Complaint → NEED_ADMIN:complaint`;
-
-    // Build messages array with system prompt at the beginning
-    const geminiMessages = [
-      {
-        role: "user",
+    // 2. Construct Body
+    const requestBody = {
+      contents: cleanHistory,
+      systemInstruction: {
         parts: [{ text: systemPrompt }]
       },
-      ...messages.map((msg) => ({
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: [{ text: msg.content }],
-      }))
-    ];
-
-    const requestBody = {
-      contents: geminiMessages,
       generationConfig: {
         temperature: 0.7,
         maxOutputTokens: 500,
       }
     };
 
-    console.log("📤 Sending to Gemini API...");
-
+    // 3. Send to Gemini
     const response = await fetch(GEMINI_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody),
     });
 
+    // 4. Handle Errors
     if (!response.ok) {
-      const errData = await response.text();
-      console.error("❌ Gemini API Error Status:", response.status);
-      console.error("❌ Gemini API Response:", errData);
-      return res.status(500).json({ error: "Gemini API error", details: errData });
+      const errorText = await response.text();
+      console.error("❌ Gemini API Error:", response.status, errorText);
+      // Specific check for invalid key
+      if (response.status === 404 || response.status === 403) {
+         return res.status(500).json({ error: "Invalid API Key or Model not found. Check server logs." });
+      }
+      return res.status(500).json({ error: "Gemini rejected request", details: errorText });
     }
 
     const data = await response.json();
-    console.log("✅ Gemini response:", data);
-
     const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    
+
     if (!reply) {
-      console.error("❌ No text in Gemini response:", JSON.stringify(data));
-      return res.status(500).json({ error: "No response text from Gemini" });
+      console.error("❌ No reply text:", JSON.stringify(data));
+      return res.status(500).json({ error: "Empty Gemini response" });
     }
 
-    console.log("✅ Reply:", reply.substring(0, 100) + "...");
     res.json({ reply });
 
   } catch (err) {
-    console.error("❌ Chat Error:", err.message);
-    console.error("❌ Full error:", err);
+    console.error("❌ Server Crash:", err);
     res.status(500).json({ error: err.message });
   }
 });
-
-/* ================= END OF CHAT ENDPOINT ================= */
 
 
 
