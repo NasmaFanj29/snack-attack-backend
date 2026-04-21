@@ -221,7 +221,7 @@ io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCL8Yaulhn6U8XP_YjoJOMY-a6UT_W2fJo"; 
 const MODEL_ID = "gemini-1.5-flash"; // Most stable model
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;
