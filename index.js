@@ -218,13 +218,13 @@ app.get("/orders/:id", async (req, res) => {
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 // ═══════════════════════════════════════════════════════════════════
-//  /api/chat  —  Groq (Llama 3) endpoint
+//  /api/chat  —  Gemini 1.5 Flash endpoint
 //  ENV variable required on Render:
-//    GROQ_API_KEY = gsk_...
+//    GEMINI_API_KEY = AIza...
 // ═══════════════════════════════════════════════════════════════════
 
-const Groq = require("groq-sdk");
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const GEMINI_MODEL = 'gemini-1.5-flash'; 
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 const SYSTEM_PROMPT = `You are "Sami", a professional, polite, and helpful AI assistant for Snack Attack restaurant.
 
@@ -268,39 +268,68 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  if (!process.env.GROQ_API_KEY) {
-    console.error('❌ GROQ_API_KEY missing from environment!');
+  if (!process.env.GEMINI_API_KEY) {
+    console.error('❌ GEMINI_API_KEY missing from environment!');
     return res.status(500).json({ error: 'Server configuration error — API key missing' });
   }
 
   try {
-    // 1. Format messages for Groq (OpenAI style format)
-    const formattedMessages = [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...messages.map((m) => ({
-        role: m.role === 'model' || m.role === 'assistant' ? 'assistant' : 'user',
-        content: m.content || ' ' 
-      }))
-    ];
+    const mapped = messages.map((m) => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content || ' ' }], 
+    }));
 
-    console.log(`📤 Groq request — ${formattedMessages.length} messages`);
-
-    // 2. Call Groq SDK
-    const chatCompletion = await groq.chat.completions.create({
-      messages: formattedMessages,
-      model: "llama-3.1-8b-instant", // Fast Llama 3 model
-      temperature: 0.75,
-      max_tokens: 400,
-    });
-
-    const reply = chatCompletion.choices[0]?.message?.content?.trim();
-
-    if (!reply) {
-      console.warn('⚠️ Groq returned empty reply:', chatCompletion);
-      return res.status(500).json({ error: 'Empty response from Groq' });
+    const contents = [];
+    for (const msg of mapped) {
+      const last = contents[contents.length - 1];
+      if (last && last.role === msg.role) {
+        last.parts[0].text += '\n' + msg.parts[0].text;
+      } else {
+        contents.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
+      }
     }
 
-    console.log(`✅ Groq reply (${reply.length} chars)`);
+    while (contents.length > 0 && contents[0].role !== 'user') {
+      contents.shift(); 
+    }
+
+    if (contents.length === 0) {
+      return res.status(400).json({ error: 'Conversation empty after cleaning' });
+    }
+
+    const body = {
+      contents,
+      systemInstruction: {
+        parts: [{ text: SYSTEM_PROMPT }],
+      },
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 400,
+      },
+    };
+
+    const response = await fetch(GEMINI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('❌ Gemini API Error:', JSON.stringify(data, null, 2));
+      return res.status(500).json({
+        error: 'Gemini API error',
+        details: data?.error?.message || data,
+      });
+    }
+
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
+    if (!reply) {
+      return res.status(500).json({ error: 'Empty response from Gemini' });
+    }
+
     res.json({ reply });
 
   } catch (err) {
