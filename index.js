@@ -215,80 +215,78 @@ app.get("/orders/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ... (Keep top part: imports, place-order, admin routes) ...
+
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
-
-
-// ── CHAT ENDPOINT (FINAL FIX) ───────────────────────────────────────
-// 1. Get Key from Environment (Render) OR fallback to hardcoded (for testing)
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCL8Yaulhn6U8XP_YjoJOMY-a6UT_W2fJo"; 
-
-// 2. Use v1beta (Supports systemInstruction)
+// ── CHAT ENDPOINT (ULTIMATE FIX) ───────────────────────────────────────
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
 const MODEL_ID = "gemini-1.5-flash";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;
 
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "Invalid messages format" });
+  if (!messages) {
+    return res.status(400).json({ error: "No messages" });
   }
-  
-  console.log("🔑 Using API Key starting with:", GEMINI_API_KEY.substring(0, 5));
+
+  // ⚠️ CHECK IF KEY EXISTS
+  if (!GEMINI_API_KEY) {
+    console.error("❌ FATAL: GEMINI_API_KEY is NOT set in Render Environment Variables!");
+    return res.status(500).json({ error: "Server missing API Key" });
+  }
 
   try {
-    const systemPrompt = `You are a friendly AI assistant for "Snack Attack," a burger & sandwich restaurant.
-Keep replies SHORT (max 3-4 sentences). Use food emojis naturally 🍔🍟.
-CRITICAL RULE: Understand Lebanese Franco-Arabic (Arabizi) like "bde", "kifak".
-Reply in friendly Lebanese Arabizi OR English. NEVER use Arabic script.
-MENU: Classic Smash Burger $9.99, Crispy Chicken Sandwich $10.99.
-If customer wants to add item: CART_ADD:Item Name
-If custom order: CUSTOM_ORDER:{"bread":"...","protein":"..."}`;
+    const systemPrompt = `You are a friendly AI for Snack Attack restaurant.
+Keep replies SHORT. Use emojis. Understand Arabizi (Lebanese chat).
+MENU: Classic Smash Burger $9.99, Crispy Chicken $10.99.
+Add item: CART_ADD:Name
+Custom order: CUSTOM_ORDER:json`;
 
-    // 1. Clean history (Gemini requires 'model' not 'assistant')
-    const cleanHistory = messages.map(msg => ({
+    // 1. Map roles
+    let history = messages.map(msg => ({
       role: msg.role === "assistant" ? "model" : "user",
       parts: [{ text: msg.content }]
     }));
 
-    // 2. Construct Body with systemInstruction
-    const requestBody = {
-      contents: cleanHistory,
-      systemInstruction: {
-        parts: [{ text: systemPrompt }]
-      },
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 500,
+    // 2. CRITICAL FIX: Force Alternating Roles
+    // If two messages have same role, merge them. This prevents 400 errors.
+    const fixedHistory = [];
+    for (const msg of history) {
+      const last = fixedHistory[fixedHistory.length - 1];
+      if (last && last.role === msg.role) {
+        last.parts[0].text += `\n${msg.parts[0].text}`; // Merge text
+      } else {
+        fixedHistory.push(msg);
       }
+    }
+
+    const requestBody = {
+      contents: fixedHistory,
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      generationConfig: { temperature: 0.7 }
     };
 
-    // 3. Send to Gemini
+    console.log("📤 Sending to Gemini...");
     const response = await fetch(GEMINI_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requestBody),
     });
 
-    // 4. Handle Errors
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("❌ Gemini API Error:", response.status, errorText);
-      return res.status(500).json({ error: "Gemini failed", details: errorText });
-    }
-
     const data = await response.json();
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!reply) {
-      console.error("❌ No reply text:", JSON.stringify(data));
-      return res.status(500).json({ error: "Empty Gemini response" });
+    
+    if (!response.ok) {
+      console.error("❌ Gemini Error:", JSON.stringify(data));
+      return res.status(500).json({ error: "Gemini Error", details: data });
     }
 
-    res.json({ reply });
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    res.json({ reply: reply || "Sorry, I couldn't generate a response." });
 
   } catch (err) {
-    console.error("❌ Server Crash:", err);
+    console.error("❌ Crash:", err);
     res.status(500).json({ error: err.message });
   }
 });
