@@ -252,14 +252,15 @@ ACTIONS (append to your reply when needed):
    - cheese: cheddar, american, none
    - sauce: special, bbq, mayo, none
 3. Escalate to staff:   NEED_ADMIN:reason
-   - reasons: confused | complaint | offensive | help
+   - reasons: confused | complaint | offensive | human_requested
 
 RULES:
-- Only use CART_ADD when customer clearly wants to order something
-- Only use CUSTOM_ORDER when they describe a custom/build-your-own burger
-- Only use NEED_ADMIN if you truly can't help or they ask for a human
-- Never add multiple CART_ADD lines — one per message
-- Never make up menu items not listed above`;
+- Only use CART_ADD when customer clearly wants to order something.
+- Only use CUSTOM_ORDER when they describe a custom/build-your-own burger.
+- TRY TO HELP THE CUSTOMER YOURSELF FIRST. 
+- ONLY use NEED_ADMIN if the user EXPLICITLY asks for a "human", "waiter", "staff", or "manager". Do NOT escalate just because they say the word "help".
+- Never add multiple CART_ADD lines — one per message.
+- Never make up menu items not listed above.`;
 
 app.post('/api/chat', async (req, res) => {
   const { messages } = req.body;
