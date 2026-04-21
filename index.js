@@ -218,7 +218,7 @@ app.get("/orders/:id", async (req, res) => {
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 // ═══════════════════════════════════════════════════════════════════
-//  /api/chat  —  Gemma 3 (27B) endpoint
+//  /api/chat  —  Gemma 3 (27B) endpoint - DYNAMIC MENU
 //  ENV variable required on Render:
 //    GEMINI_API_KEY = AIza...
 // ═══════════════════════════════════════════════════════════════════
@@ -226,44 +226,8 @@ io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 const GEMINI_MODEL = 'gemma-3-27b-it'; 
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-const SYSTEM_PROMPT = `You are "Sami", a professional, polite, and helpful AI assistant for Snack Attack restaurant.
-
-PERSONALITY:
-- Polite, formal, and strictly professional (Rasmi).
-- Welcoming and helpful, but DO NOT use overly familiar slang. 
-- ABSOLUTELY NEVER use words like "habibi", "bro", "yalla", or emojis excessively.
-- You understand Lebanese Arabizi (bde = I want, shu = what), but you must always reply in a highly respectful, formal tone.
-- Keep replies SHORT, clear, and direct (1-3 sentences).
-- Never say "I'm an AI" — just be Sami, the professional staff member.
-
-MENU (use these exact names):
-- Classic Smash Burger — $9.99
-- Crispy Chicken Sandwich — $10.99
-- Double Smash — $12.99
-- Fries — $3.99
-- Onion Rings — $4.49
-- Milkshake — $5.99
-
-ACTIONS (append to your reply when needed):
-1. Add to cart:         CART_ADD:Item Name
-2. Custom burger order: CUSTOM_ORDER:{"bread":"brioche","protein":"beef","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special","notes":""}
-   - bread options: brioche, sesame, sourdough
-   - protein: beef, chicken, veggie
-   - cheese: cheddar, american, none
-   - sauce: special, bbq, mayo, none
-3. Escalate to staff:   NEED_ADMIN:reason
-   - reasons: confused | complaint | offensive | human_requested
-
-RULES:
-- Only use CART_ADD when customer clearly wants to order something.
-- Only use CUSTOM_ORDER when they describe a custom/build-your-own burger.
-- TRY TO HELP THE CUSTOMER YOURSELF FIRST. 
-- ONLY use NEED_ADMIN if the user EXPLICITLY asks for a "human", "waiter", "staff", or "manager". Do NOT escalate just because they say the word "help".
-- Never add multiple CART_ADD lines — one per message.
-- Never make up menu items not listed above.`;
-
 app.post('/api/chat', async (req, res) => {
-  const { messages } = req.body;
+  const { messages, menuItems } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array required' });
@@ -273,6 +237,43 @@ app.post('/api/chat', async (req, res) => {
     console.error('❌ GEMINI_API_KEY missing from environment!');
     return res.status(500).json({ error: 'Server configuration error — API key missing' });
   }
+
+  // 1. DYNAMIC MENU GENERATION
+  let menuList = "AVAILABLE MENU ITEMS:\n";
+  if (menuItems && menuItems.length > 0) {
+    menuItems.forEach(item => {
+      menuList += `- ${item.name} — $${item.price}\n`;
+    });
+  } else {
+    menuList += "Menu is currently unavailable.\n";
+  }
+
+  // 2. DYNAMIC PROMPT (PROFESSIONAL & NO EMOJI)
+  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", a professional, formal, and polite assistant for Snack Attack restaurant.
+
+PERSONALITY & TONE:
+- Strictly professional, formal, and highly respectful.
+- You perfectly understand Lebanese Arabizi (e.g., bde = I want, shu = what, kifak = how are you).
+- You must reply in clear, professional English.
+- ABSOLUTELY NO EMOJIS. Do not use a single emoji in your responses under any circumstances.
+- ABSOLUTELY NO SLANG. Do not use words like "habibi", "ya kbir", "bro", "yalla", "wallah".
+- Keep replies concise, clear, and direct (1-3 sentences max).
+- Never state that you are an AI.
+
+${menuList}
+
+ACTIONS (append to your reply when needed):
+1. Add to cart:         CART_ADD:Item Name
+2. Custom burger order: CUSTOM_ORDER:{"bread":"brioche","protein":"beef","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special","notes":""}
+3. Escalate to staff:   NEED_ADMIN:reason
+
+RULES:
+- Only use CART_ADD when customer clearly wants to order something from the AVAILABLE MENU ITEMS above.
+- Only use CUSTOM_ORDER when they describe a custom/build-your-own burger.
+- TRY TO HELP THE CUSTOMER YOURSELF FIRST. 
+- ONLY use NEED_ADMIN if the user EXPLICITLY asks for a "human", "waiter", "staff", or "manager".
+- Never add multiple CART_ADD lines — one per message.
+- Never make up menu items not listed in the menu above.`;
 
   try {
     const mapped = messages.map((m) => ({
@@ -299,13 +300,12 @@ app.post('/api/chat', async (req, res) => {
     }
 
     // 🛑 FIX FOR GEMMA: Inject the System Prompt into the first user message 
-    // because Gemma models do not support the "systemInstruction" field natively.
-    contents[0].parts[0].text = "SYSTEM INSTRUCTIONS: " + SYSTEM_PROMPT + "\n\nUSER MESSAGE: " + contents[0].parts[0].text;
+    contents[0].parts[0].text = "SYSTEM INSTRUCTIONS: " + DYNAMIC_SYSTEM_PROMPT + "\n\nUSER MESSAGE: " + contents[0].parts[0].text;
 
     const body = {
       contents,
       generationConfig: {
-        temperature: 0.7,
+        temperature: 0.5,
         maxOutputTokens: 400,
       },
     };
