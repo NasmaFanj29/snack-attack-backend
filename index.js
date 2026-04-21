@@ -317,7 +317,7 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`📤 Gemini request — ${contents.length} messages`);
 
-    const response = await fetch(GEMINI_URL(), {
+    const response = await fetch(GEMINI_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
