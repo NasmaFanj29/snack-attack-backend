@@ -1,218 +1,325 @@
+const express = require("express");
+const http = require("http");
+const cors = require("cors");
+const { Server } = require("socket.io");
+const pool = require('./db');
+
+const app = express();
+app.use(cors());
+app.use(express.json());  // ← CRITICAL - enables JSON parsing
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+
+
+/* ================= PLACE ORDER (Robust) ================= */
 app.post("/place-order", async (req, res) => {
   const { customer, table_id, total_price, items, payment_splits } = req.body;
-
   const phone = customer?.phone || "000000";
   const name = customer?.name || "Guest";
 
+  console.log("📦 Place Order Request Received");
+
+  let conn;
   try {
-    const conn = await pool.getConnection();
+    conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    try {
-      let [userRows] = await conn.query(
-        "SELECT user_id FROM users WHERE phone_number = ?",
-        [phone]
-      );
-
-      let userId;
-
-      if (!userRows.length) {
-        const [u] = await conn.query(
-          "INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)",
-          [name, phone]
-        );
-        userId = u.insertId;
-      } else {
-        userId = userRows[0].user_id;
-      }
-
-      const [order] = await conn.query(
-        `INSERT INTO orders (table_id, total_price, status, user_id, payment_splits)
-         VALUES (?, ?, ?, ?, ?)`,
-        [
-          table_id || 1,
-          total_price,
-          "Requested",
-          userId,
-          JSON.stringify(payment_splits || [])
-        ]
-      );
-
-      const orderId = order.insertId;
-
-      for (const item of items || []) {
-        const itemId =
-          item.databaseId || item.item_id || item.menu_id || item.id;
-
-        if (!itemId) continue;
-
-        // ✅ NEW: Store specialNote and removedExtras
-        const specialNote = item.specialNote || null;
-        const removedExtras = item.removedExtras 
-          ? JSON.stringify(item.removedExtras) 
-          : null;
-
-        await conn.query(
-          `INSERT INTO order_items (order_id, item_id, quantity, price_at_time, special_note, removed_extras)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            orderId, 
-            itemId, 
-            item.quantity || 1, 
-            item.price || 0,
-            specialNote,
-            removedExtras
-          ]
-        );
-      }
-
-      await conn.commit();
-      res.json({ success: true, orderId });
-
-    } catch (e) {
-      await conn.rollback();
-      throw e;
-    } finally {
-      conn.release();
+    // 1. User Handling
+    let [userRows] = await conn.query("SELECT user_id FROM users WHERE phone_number = ?", [phone]);
+    let userId;
+    if (!userRows.length) {
+      const [u] = await conn.query("INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)", [name, phone]);
+      userId = u.insertId;
+    } else {
+      userId = userRows[0].user_id;
     }
+
+    // 2. Insert Order
+    const [order] = await conn.query(
+      `INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, 'Requested', ?, ?)`,
+      [table_id || 1, total_price, userId, JSON.stringify(payment_splits || [])]
+    );
+    const orderId = order.insertId;
+
+    // 3. Insert Items (Smart Logic)
+    let savedCount = 0;
+    
+    for (const item of items || []) {
+      // أ. محاولة جلب ID من الفرونت إند
+      let itemId = item.databaseId || item.item_id || item.menu_id || item.id || null;
+
+      // ب. حل سحري: إذا ID مش موجود، ندور عليه بالقاعدة عن طريق الاسم
+      if (!itemId && item.name) {
+         const [menuRows] = await conn.query("SELECT id FROM menuitems WHERE name = ? LIMIT 1", [item.name]);
+         if (menuRows.length) {
+           itemId = menuRows[0].id;
+           console.log(`🔍 Found ID for "${item.name}": ${itemId}`);
+         }
+      }
+
+      if (!itemId) {
+        console.warn(`⚠️ SKIPPED "${item.name}" — no ID found in DB or Request`);
+        continue;
+      }
+
+      // ج. تجهيز البيانات
+      const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
+      const removedExtras = item.removedExtras ? JSON.stringify(item.removedExtras) : null;
+      const specialNote = item.specialNote || null;
+
+      await conn.query(
+        `INSERT INTO order_items 
+          (order_id, item_id, quantity, price_at_time, special_note, removed_extras, selected_extras)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [orderId, itemId, item.quantity || 1, item.price || 0, specialNote, removedExtras, selectedExtras]
+      );
+      savedCount++;
+    }
+
+    await conn.commit();
+    console.log(`✅ Order #${orderId} saved with ${savedCount} items.`);
+    res.json({ success: true, orderId });
 
   } catch (err) {
+    if (conn) await conn.rollback();
+    console.error("❌ Place Order Error:", err.message);
     res.status(500).json({ error: err.message });
+  } finally {
+    if (conn) conn.release();
   }
 });
 
-/* ================= GET ORDER (Updated) ================= */
-
-app.get("/orders/:id", async (req, res) => {
-  const [order] = await pool.query(
-    "SELECT * FROM orders WHERE id = ?",
-    [req.params.id]
-  );
-
-  const [items] = await pool.query(
-    `SELECT oi.*, m.name
-     FROM order_items oi
-     LEFT JOIN menuitems m ON oi.item_id = m.id
-     WHERE oi.order_id = ?`,
-    [req.params.id]
-  );
-
-  // ✅ Parse special_note and removed_extras for frontend
-  const parsedItems = items.map(item => ({
-    ...item,
-    special_note: item.special_note || null,
-    removed_extras: item.removed_extras 
-      ? JSON.parse(item.removed_extras) 
-      : null
-  }));
-
-  res.json({ order: order[0], items: parsedItems });
-});
-
-/* ================= UPDATE ITEM WITH NOTES ================= */
-
-app.post("/orders/:id/update-item", async (req, res) => {
-  const orderId = req.params.id;
-  const { action, item } = req.body;
-
-  const itemId =
-    item.item_id || item.databaseId || item.id || item.menu_id;
-
-  if (!itemId) {
-    return res.status(400).json({ error: "Invalid item" });
-  }
-
-  const [existing] = await pool.query(
-    "SELECT id, quantity FROM order_items WHERE order_id = ? AND item_id = ? LIMIT 1",
-    [orderId, itemId]
-  );
-
-  if (action === "add") {
-    if (existing.length) {
-      await pool.query(
-        "UPDATE order_items SET quantity = quantity + 1 WHERE id = ?",
-        [existing[0].id]
-      );
-    } else {
-      // ✅ NEW: Support special_note and removed_extras
-      const specialNote = item.specialNote || null;
-      const removedExtras = item.removedExtras 
-        ? JSON.stringify(item.removedExtras) 
-        : null;
-
-      await pool.query(
-        `INSERT INTO order_items (order_id, item_id, quantity, price_at_time, special_note, removed_extras) 
-         VALUES (?, ?, 1, ?, ?, ?)`,
-        [orderId, itemId, item.price || 0, specialNote, removedExtras]
-      );
-    }
-  }
-
-  if (action === "remove" && existing.length) {
-    if (existing[0].quantity > 1) {
-      await pool.query(
-        "UPDATE order_items SET quantity = quantity - 1 WHERE id = ?",
-        [existing[0].id]
-      );
-    } else {
-      await pool.query(
-        "DELETE FROM order_items WHERE id = ?",
-        [existing[0].id]
-      );
-    }
-  }
-
-  const [sum] = await pool.query(
-    "SELECT SUM(quantity * price_at_time) as total FROM order_items WHERE order_id = ?",
-    [orderId]
-  );
-
-  const newTotal = sum[0].total || 0;
-
-  await pool.query(
-    "UPDATE orders SET total_price = ? WHERE id = ?",
-    [newTotal, orderId]
-  );
-
-  // 🔥 REALTIME UPDATE
-  io.to(String(orderId)).emit("cartUpdated");
-
-  res.json({ success: true, newTotal });
-});
-
-/* ================= ADMIN DASHBOARD (Display Notes) ================= */
+/* ================= ADMIN DASHBOARD (Debugged) ================= */
+// ✅ REPLACE the /admin/orders endpoint in server.js with this:
 
 app.get("/admin/orders", async (req, res) => {
   try {
-    const [rows] = await pool.query(`
-      SELECT o.id, o.total_price, o.status, o.created_at, o.table_id, o.payment_splits,
-             u.full_name, u.phone_number FROM orders o
-      LEFT JOIN users u ON o.user_id = u.user_id ORDER BY o.created_at DESC`);
+    console.log("📦 Fetching all orders...");
     
-    // ✅ Enhance with items including notes
-    const enrichedRows = await Promise.all(
-      rows.map(async (order) => {
-        const [items] = await pool.query(
-          `SELECT oi.*, m.name FROM order_items oi
-           LEFT JOIN menuitems m ON oi.item_id = m.id
-           WHERE oi.order_id = ?`,
-          [order.id]
-        );
-        
-        const parsedItems = items.map(item => ({
-          ...item,
-          special_note: item.special_note || null,
-          removed_extras: item.removed_extras 
-            ? JSON.parse(item.removed_extras) 
-            : null
-        }));
+    // 1. Fetch Orders
+    const [orders] = await pool.query(`
+      SELECT 
+        o.id, 
+        o.total_price, 
+        o.status, 
+        o.created_at, 
+        o.table_id, 
+        o.payment_splits,
+        u.full_name, 
+        u.phone_number 
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.user_id 
+      ORDER BY o.created_at DESC
+    `);
 
-        return { ...order, items: parsedItems };
-      })
-    );
+    if (orders.length === 0) {
+      console.log("ℹ️ No orders found");
+      return res.json([]);
+    }
 
-    res.json(enrichedRows);
+    console.log(`📋 Found ${orders.length} orders`);
+
+    // 2. Fetch ALL Items for ALL orders in ONE query
+    const orderIds = orders.map(o => o.id);
+    
+    let [allItems] = await pool.query(`
+      SELECT 
+        oi.id,
+        oi.order_id, 
+        oi.item_id, 
+        oi.quantity, 
+        oi.price_at_time,
+        oi.special_note,
+        oi.removed_extras,
+        oi.selected_extras,
+        m.name,
+        m.image,
+        m.description
+      FROM order_items oi
+      LEFT JOIN menuitems m ON oi.item_id = m.id
+      WHERE oi.order_id IN (${orderIds.map(() => '?').join(',')})
+      ORDER BY oi.order_id, oi.id
+    `, orderIds);
+
+    console.log(`🔍 Found ${allItems.length} items total across all orders`);
+
+    // 3. Map items and parse JSON fields
+    const itemsMap = {};
+    
+    (allItems || []).forEach(item => {
+      const parsed = {
+        id: item.id,
+        item_id: item.item_id,
+        order_id: item.order_id,
+        name: item.name || `Item #${item.item_id}`,
+        image: item.image,
+        description: item.description,
+        quantity: item.quantity || 1,
+        price_at_time: item.price_at_time || 0,
+        special_note: item.special_note || null,
+        selected_extras: item.selected_extras 
+          ? (typeof item.selected_extras === 'string' 
+              ? JSON.parse(item.selected_extras) 
+              : item.selected_extras)
+          : [],
+        removed_extras: item.removed_extras 
+          ? (typeof item.removed_extras === 'string' 
+              ? JSON.parse(item.removed_extras) 
+              : item.removed_extras)
+          : []
+      };
+      
+      if (!itemsMap[item.order_id]) itemsMap[item.order_id] = [];
+      itemsMap[item.order_id].push(parsed);
+    });
+
+    // 4. Combine orders with their items
+    const result = orders.map(order => ({
+      id: order.id,
+      table_id: order.table_id,
+      status: order.status,
+      created_at: order.created_at,
+      total_price: order.total_price,
+      payment_splits: order.payment_splits,
+      full_name: order.full_name || 'Guest',
+      phone_number: order.phone_number,
+      // ✅ Include items in multiple formats for compatibility
+      items: itemsMap[order.id] || [],
+      order_items: itemsMap[order.id] || []  // Backup name
+    }));
+
+    console.log(`✅ Returning ${result.length} orders with items`);
+    res.json(result);
+
   } catch (err) {
+    console.error("❌ Admin Fetch Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
+
+/* ================= HELPERS & OTHER ROUTES ================= */
+function parseJsonSafe(str) {
+  if (!str) return null;
+  try { return JSON.parse(str); } catch { return str; }
+}
+
+app.get("/orders/:id", async (req, res) => {
+  try {
+    const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
+    if (!order.length) return res.status(404).json({ error: "Not found" });
+    const [items] = await pool.query(`SELECT oi.*, m.name FROM order_items oi LEFT JOIN menuitems m ON oi.item_id = m.id WHERE oi.order_id = ?`, [req.params.id]);
+    const parsedItems = items.map(item => ({ ...item, selected_extras: parseJsonSafe(item.selected_extras), removed_extras: parseJsonSafe(item.removed_extras) }));
+    res.json({ order: order[0], items: parsedItems });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+io.on("connection", (socket) => console.log("Socket connected:", socket.id));
+
+/* ── FIXED GEMINI CHAT ENDPOINT ────────────────────────────────── */
+const GEMINI_API_KEY = "AIzaSyB7S_U0TSZNFRU4wbv3gTXs43Bu5VqJ7Ko";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+app.post("/api/chat", async (req, res) => {
+  const { messages } = req.body;
+
+  if (!messages || !Array.isArray(messages)) {
+    return res.status(400).json({ error: "Invalid messages format" });
+  }
+
+  console.log("💬 Chat request received with", messages.length, "messages");
+
+  try {
+    // System prompt
+    const systemPrompt = `You are a friendly AI assistant for "Snack Attack," a burger & sandwich restaurant.
+Keep replies SHORT (max 3-4 sentences). Use food emojis naturally 🍔🍟.
+
+CRITICAL RULE: Understand Lebanese Franco-Arabic (Arabizi) like "bde", "kifak", "shou", "3m", "toum", "yalla".
+Reply in friendly Lebanese Arabizi OR English. NEVER use Arabic script.
+
+════ MENU ════
+- Classic Smash Burger $9.99
+- Crispy Chicken Sandwich $10.99
+- BBQ Bacon Stack $12.99
+- Veggie Delight $9.49
+- Loaded Fries $5.99
+- Oreo Milkshake $6.99
+- Strawberry Lemonade $4.99
+
+════ ADD TO CART ════
+If customer wants to add an item, output on a new line EXACTLY:
+CART_ADD:Classic Smash Burger
+
+════ CUSTOM BURGER FLOW ════
+Collect: 1. Bread 2. Protein 3. Cheese 4. Veggies 5. Sauce 6. Notes
+When ALL confirmed, say "Perfect! Sending your custom order! 🍔✨" then:
+CUSTOM_ORDER:{"bread":"...","protein":"...","cheese":"...","veggies":"...","sauce":"...","notes":"..."}
+
+════ ESCALATION ════
+After 2 failed attempts → NEED_ADMIN:confused
+Rude → NEED_ADMIN:offensive
+Complaint → NEED_ADMIN:complaint`;
+
+    // Build messages array with system prompt at the beginning
+    const geminiMessages = [
+      {
+        role: "user",
+        parts: [{ text: systemPrompt }]
+      },
+      ...messages.map((msg) => ({
+        role: msg.role === "assistant" ? "model" : "user",
+        parts: [{ text: msg.content }],
+      }))
+    ];
+
+    const requestBody = {
+      contents: geminiMessages,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 500,
+      }
+    };
+
+    console.log("📤 Sending to Gemini API...");
+
+    const response = await fetch(GEMINI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!response.ok) {
+      const errData = await response.text();
+      console.error("❌ Gemini API Error Status:", response.status);
+      console.error("❌ Gemini API Response:", errData);
+      return res.status(500).json({ error: "Gemini API error", details: errData });
+    }
+
+    const data = await response.json();
+    console.log("✅ Gemini response:", data);
+
+    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!reply) {
+      console.error("❌ No text in Gemini response:", JSON.stringify(data));
+      return res.status(500).json({ error: "No response text from Gemini" });
+    }
+
+    console.log("✅ Reply:", reply.substring(0, 100) + "...");
+    res.json({ reply });
+
+  } catch (err) {
+    console.error("❌ Chat Error:", err.message);
+    console.error("❌ Full error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= END OF CHAT ENDPOINT ================= */
+
+
+
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
