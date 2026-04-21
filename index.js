@@ -219,8 +219,12 @@ io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 
 
+// ── CHAT ENDPOINT (FINAL FIX) ───────────────────────────────────────
+// 1. Get Key from Environment (Render) OR fallback to hardcoded (for testing)
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AIzaSyCL8Yaulhn6U8XP_YjoJOMY-a6UT_W2fJo"; 
-const MODEL_ID = "gemini-1.5-flash"; // Most stable model
+
+// 2. Use v1beta (Supports systemInstruction)
+const MODEL_ID = "gemini-1.5-flash";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_ID}:generateContent?key=${GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
@@ -229,38 +233,25 @@ app.post("/api/chat", async (req, res) => {
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: "Invalid messages format" });
   }
-
-  // Basic check for missing key
-  if (!GEMINI_API_KEY || GEMINI_API_KEY === "YOUR_NEW_API_KEY_HERE") {
-    console.error("❌ CRITICAL: Gemini API Key is missing in server.js!");
-    return res.status(500).json({ error: "Server misconfigured: Missing API Key" });
-  }
+  
+  console.log("🔑 Using API Key starting with:", GEMINI_API_KEY.substring(0, 5));
 
   try {
     const systemPrompt = `You are a friendly AI assistant for "Snack Attack," a burger & sandwich restaurant.
 Keep replies SHORT (max 3-4 sentences). Use food emojis naturally 🍔🍟.
-
-CRITICAL RULE: Understand Lebanese Franco-Arabic (Arabizi) like "bde", "kifak", "shou", "3m", "toum", "yalla".
+CRITICAL RULE: Understand Lebanese Franco-Arabic (Arabizi) like "bde", "kifak".
 Reply in friendly Lebanese Arabizi OR English. NEVER use Arabic script.
+MENU: Classic Smash Burger $9.99, Crispy Chicken Sandwich $10.99.
+If customer wants to add item: CART_ADD:Item Name
+If custom order: CUSTOM_ORDER:{"bread":"...","protein":"..."}`;
 
-MENU:
-- Classic Smash Burger $9.99
-- Crispy Chicken Sandwich $10.99
-- BBQ Bacon Stack $12.99
-- Veggie Delight $9.49
-- Loaded Fries $5.99
-
-If customer wants to add an item, output on a new line: CART_ADD:Item Name
-If custom burger, collect details then output: CUSTOM_ORDER:{"bread":"...","protein":"..."}
-If stuck, output: NEED_ADMIN:reason`;
-
-    // 1. Clean history
+    // 1. Clean history (Gemini requires 'model' not 'assistant')
     const cleanHistory = messages.map(msg => ({
       role: msg.role === "assistant" ? "model" : "user",
       parts: [{ text: msg.content }]
     }));
 
-    // 2. Construct Body
+    // 2. Construct Body with systemInstruction
     const requestBody = {
       contents: cleanHistory,
       systemInstruction: {
@@ -283,11 +274,7 @@ If stuck, output: NEED_ADMIN:reason`;
     if (!response.ok) {
       const errorText = await response.text();
       console.error("❌ Gemini API Error:", response.status, errorText);
-      // Specific check for invalid key
-      if (response.status === 404 || response.status === 403) {
-         return res.status(500).json({ error: "Invalid API Key or Model not found. Check server logs." });
-      }
-      return res.status(500).json({ error: "Gemini rejected request", details: errorText });
+      return res.status(500).json({ error: "Gemini failed", details: errorText });
     }
 
     const data = await response.json();
@@ -305,9 +292,6 @@ If stuck, output: NEED_ADMIN:reason`;
     res.status(500).json({ error: err.message });
   }
 });
-
-
-
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
