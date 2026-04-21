@@ -218,16 +218,14 @@ app.get("/orders/:id", async (req, res) => {
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
 // ═══════════════════════════════════════════════════════════════════
-//  /api/chat  —  Gemini 2.0 Flash endpoint
-//  Replace the existing app.post("/api/chat", ...) in server.js
-//  with this entire block.
-//
+//  /api/chat  —  Groq (Llama 3) endpoint
 //  ENV variable required on Render:
-//    GEMINI_API_KEY = AIza...
+//    GROQ_API_KEY = gsk_...
 // ═══════════════════════════════════════════════════════════════════
 
-const GEMINI_MODEL = 'gemini-1.5-flash-latest'; // Aw 'gemini-2.0-flash' eza l API key taba3ak byed3amo
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+const Groq = require("groq-sdk");
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
 const SYSTEM_PROMPT = `You are "Sami", a friendly AI assistant for Snack Attack restaurant.
 
 PERSONALITY:
@@ -270,77 +268,39 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  if (!process.env.GEMINI_API_KEY) {
-    console.error('❌ GEMINI_API_KEY missing from environment!');
+  if (!process.env.GROQ_API_KEY) {
+    console.error('❌ GROQ_API_KEY missing from environment!');
     return res.status(500).json({ error: 'Server configuration error — API key missing' });
   }
 
   try {
-    // 1. Map roles: 'assistant' → 'model'
-    // 🛑 FIX: Add a fallback space so Gemini never gets an empty string
-    const mapped = messages.map((m) => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content || ' ' }], 
-    }));
+    // 1. Format messages for Groq (OpenAI style format)
+    const formattedMessages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...messages.map((m) => ({
+        role: m.role === 'model' || m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content || ' ' 
+      }))
+    ];
 
-    // 2. Merge consecutive same-role messages (Gemini requires alternating)
-    const contents = [];
-    for (const msg of mapped) {
-      const last = contents[contents.length - 1];
-      if (last && last.role === msg.role) {
-        last.parts[0].text += '\n' + msg.parts[0].text;
-      } else {
-        contents.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
-      }
-    }
+    console.log(`📤 Groq request — ${formattedMessages.length} messages`);
 
-    // 3. Must start with 'user' role
-    // 🛑 FIX: Instead of throwing an error, just remove the bot's first message!
-    while (contents.length > 0 && contents[0].role !== 'user') {
-      contents.shift(); 
-    }
-
-    if (contents.length === 0) {
-      return res.status(400).json({ error: 'Conversation empty after cleaning' });
-    }
-
-    const body = {
-      contents,
-      systemInstruction: {
-        parts: [{ text: SYSTEM_PROMPT }],
-      },
-      generationConfig: {
-        temperature: 0.75,
-        maxOutputTokens: 400,
-      },
-    };
-
-    console.log(`📤 Gemini request — ${contents.length} messages`);
-
-    const response = await fetch(GEMINI_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+    // 2. Call Groq SDK
+    const chatCompletion = await groq.chat.completions.create({
+      messages: formattedMessages,
+      model: "llama3-8b-8192", // Fast Llama 3 model
+      temperature: 0.75,
+      max_tokens: 400,
     });
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      console.error('❌ Gemini API Error:', JSON.stringify(data, null, 2));
-      return res.status(500).json({
-        error: 'Gemini API error',
-        details: data?.error?.message || data,
-      });
-    }
-
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    const reply = chatCompletion.choices[0]?.message?.content?.trim();
 
     if (!reply) {
-      console.warn('⚠️ Gemini returned empty reply:', JSON.stringify(data));
-      return res.status(500).json({ error: 'Empty response from Gemini' });
+      console.warn('⚠️ Groq returned empty reply:', chatCompletion);
+      return res.status(500).json({ error: 'Empty response from Groq' });
     }
 
-    console.log(`✅ Gemini reply (${reply.length} chars)`);
+    console.log(`✅ Groq reply (${reply.length} chars)`);
     res.json({ reply });
 
   } catch (err) {
