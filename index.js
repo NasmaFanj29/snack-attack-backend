@@ -226,8 +226,8 @@ io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 //    GEMINI_API_KEY = AIza...
 // ═══════════════════════════════════════════════════════════════════
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`;
+const GEMINI_MODEL = 'gemini-1.5-flash-latest'; // Aw 'gemini-2.0-flash' eza l API key taba3ak byed3amo
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 const SYSTEM_PROMPT = `You are "Sami", a friendly AI assistant for Snack Attack restaurant.
 
 PERSONALITY:
