@@ -46,13 +46,15 @@ app.post("/place-order", async (req, res) => {
     for (const item of items || []) {
       let itemId = item.databaseId || item.item_id || item.menu_id || item.id || null;
 
-      if (!itemId && item.name) {
-        const [menuRows] = await conn.query("SELECT id FROM menuitems WHERE name = ? LIMIT 1", [item.name]);
-        if (menuRows.length) {
-          itemId = menuRows[0].id;
-          console.log(`🔍 Found ID for "${item.name}": ${itemId}`);
-        }
+      if (typeof itemId === 'string' && itemId.includes('custom')) {
+        itemId = null;
       }
+
+      // 3. Eza l ID NULL w hayda custom burger, byeghla2o bl order_items
+      if (!itemId && item.isCustom) {
+        console.log(`🍔 Custom order: "${item.name}" — saving with null item_id`);
+        }
+      
 
       // Handle custom burger orders (no DB item ID)
       if (!itemId && item.isCustom) {
