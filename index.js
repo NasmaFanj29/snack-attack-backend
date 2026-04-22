@@ -192,6 +192,19 @@ app.get("/menu", async (req, res) => {
   }
 });
 
+/* ================= GET ITEM EXTRAS ================= */
+// L React 3m yotlob hayda l link, fa badna nrodd 3ley:
+app.get("/item-extras/:id", async (req, res) => {
+  try {
+    // 3m nes7ab l data mn l table taba3ek l 7a2i2e yalli esmo 'extra_options'
+    const [extras] = await pool.query("SELECT * FROM extra_options");
+    res.json(extras);
+  } catch (err) {
+    console.error("❌ Error fetching item extras:", err.message);
+    res.status(500).json({ error: "Failed to fetch extras" });
+  }
+});
+
 app.get("/orders/:id", async (req, res) => {
   try {
     const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
@@ -201,6 +214,7 @@ app.get("/orders/:id", async (req, res) => {
     res.json({ order: order[0], items: parsedItems });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 
 io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 
