@@ -107,9 +107,7 @@ app.post("/place-order", async (req, res) => {
 app.get("/admin/orders", async (req, res) => {
   try {
     const [orders] = await pool.query(`
-      SELECT 
-        o.id, o.total_price, o.status, o.created_at, o.table_id, o.payment_splits,
-        u.full_name, u.phone_number 
+      SELECT o.*, u.full_name, u.phone_number 
       FROM orders o
       LEFT JOIN users u ON o.user_id = u.user_id 
       ORDER BY o.created_at DESC
@@ -120,10 +118,7 @@ app.get("/admin/orders", async (req, res) => {
     const orderIds = orders.map(o => o.id);
 
     let [allItems] = await pool.query(`
-      SELECT 
-        oi.id, oi.order_id, oi.item_id, oi.quantity, oi.price_at_time,
-        oi.special_note, oi.removed_extras, oi.selected_extras,
-        m.name, m.image, m.description
+      SELECT oi.*, m.name 
       FROM order_items oi
       LEFT JOIN menuitems m ON oi.item_id = m.id
       WHERE oi.order_id IN (${orderIds.map(() => '?').join(',')})
@@ -133,41 +128,23 @@ app.get("/admin/orders", async (req, res) => {
     const itemsMap = {};
     (allItems || []).forEach(item => {
       const parsed = {
-        id: item.id,
-        item_id: item.item_id,
-        order_id: item.order_id,
-        name: item.name || (item.special_note?.startsWith('Custom:') ? 'Custom Burger' : `Item #${item.item_id}`),
-        image: item.image,
-        description: item.description,
-        quantity: item.quantity || 1,
-        price_at_time: item.price_at_time || 0,
-        special_note: item.special_note || null,
-        selected_extras: item.selected_extras
-          ? (typeof item.selected_extras === 'string' ? JSON.parse(item.selected_extras) : item.selected_extras)
-          : [],
-        removed_extras: item.removed_extras
-          ? (typeof item.removed_extras === 'string' ? JSON.parse(item.removed_extras) : item.removed_extras)
-          : [],
+        ...item,
+        name: item.name || (item.special_note?.startsWith('Custom:') ? 'Custom Burger' : `Item #${item.item_id || item.id}`),
+        selected_extras: parseJsonSafe(item.selected_extras) || [],
+        removed_extras: parseJsonSafe(item.removed_extras) || []
       };
       if (!itemsMap[item.order_id]) itemsMap[item.order_id] = [];
       itemsMap[item.order_id].push(parsed);
     });
 
     const result = orders.map(order => ({
-      id: order.id,
-      table_id: order.table_id,
-      status: order.status,
-      created_at: order.created_at,
-      total_price: order.total_price,
-      payment_splits: order.payment_splits,
+      ...order,
       full_name: order.full_name || 'Guest',
-      phone_number: order.phone_number,
       items: itemsMap[order.id] || [],
-      order_items: itemsMap[order.id] || [],
+      order_items: itemsMap[order.id] || []
     }));
 
     res.json(result);
-
   } catch (err) {
     console.error("❌ Admin Fetch Error:", err);
     res.status(500).json({ error: err.message });
