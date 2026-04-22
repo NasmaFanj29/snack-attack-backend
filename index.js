@@ -180,6 +180,18 @@ function parseJsonSafe(str) {
   try { return JSON.parse(str); } catch { return str; }
 }
 
+/* ================= GET MENU ITEMS ================= */
+app.get("/menu", async (req, res) => {
+  try {
+    // T2akkadi inno esem l table 3endek bl DB howe 'menuitems'
+    const [items] = await pool.query("SELECT * FROM menuitems");
+    res.json(items);
+  } catch (err) {
+    console.error("❌ Error fetching menu:", err);
+    res.status(500).json({ error: "Failed to fetch menu items" });
+  }
+});
+
 app.get("/orders/:id", async (req, res) => {
   try {
     const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
@@ -206,12 +218,27 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  if (!process.env.GEMINI_API_KEY) {
-    console.error('❌ GEMINI_API_KEY missing from environment!');
-    return res.status(500).json({ error: 'Server configuration error — API key missing' });
+  // ── 1. Fetch Custom Options from Database ─────────────────────
+ let extrasText = "AVAILABLE CUSTOM OPTIONS (Bread, Protein, Cheese, Veggies, Sauce):\n";
+  try {
+    // T2akkadi mn esem l table hon b phpMyAdmin!
+    const [extras] = await pool.query("SELECT category, name FROM extra_options"); 
+    
+    if (extras.length > 0) {
+      extras.forEach(ext => {
+        extrasText += `- ${ext.category}: ${ext.name}\n`;
+      });
+    } else {
+      extrasText += "Custom options are currently unavailable.\n";
+    }
+  } catch (err) {
+    console.error("❌ Error fetching extras:", err.message);
   }
 
-  // ── Build dynamic menu list ──────────────────────────────────
+  // ZIDI HAYDA L SATR LA TSHOUFI SHOU 3M YOUSAL LAL AI:
+  console.log("🍔 EXTRAS SENT TO AI: \n", extrasText);
+
+  // ── 2. Build dynamic menu list ────────────────────────────────
   let menuList = "AVAILABLE MENU ITEMS:\n";
   if (menuItems && menuItems.length > 0) {
     menuItems.forEach(item => {
@@ -222,24 +249,34 @@ app.post('/api/chat', async (req, res) => {
   }
 
   // ── System Prompt ────────────────────────────────────────────
+ // ── System Prompt ────────────────────────────────────────────
   const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", the friendly and helpful assistant at Snack Attack restaurant.
 
-PERSONALITY & TONE:
-- Warm, friendly, and genuinely helpful — like a knowledgeable friend who works at the restaurant.
+CRITICAL RULE 1: LANGUAGE LOCK (NO ENGLISH ALLOWED)
+- YOU MUST REPLY IN LEBANESE ARABIZI (Franco-Arabic) 100% OF THE TIME.
+- EVEN IF THE USER WRITES IN PERFECT ENGLISH, YOU MUST REPLY IN LEBANESE ARABIZI.
+- NEVER reply in formal English. NEVER.
+- Use words like: "Tekram", "Ehh akid", "Shu 3abelak", "Sa7ten", "Yalla", "3a rasi".
 - Keep replies short and conversational (1-3 sentences). Never write long paragraphs.
-- You understand Lebanese Arabizi perfectly. Examples: "bde" = I want, "shu" = what, "ma3i" = with me, "kifak" = how are you, "marhaba" = hello, "ktir" = very, "3ajib" = amazing, "eza" = if, "hek" = like this, "yih" = wow, "bas" = just/only, "la2" = no, "na3am" = yes, "haida" = this, "chou" = what, "mni7" = good.
-- Always reply in clear, natural English regardless of what language the customer writes in.
 - ABSOLUTELY NO EMOJIS. Not a single one, ever.
-- ABSOLUTELY NO SLANG OR FILLER WORDS. No "habibi", "bro", "yo", "yalla", "wallah", "khalas", "3anjad", "chi kamen", or any similar expressions.
-- Never refer to yourself as an AI or a bot.
-- Be solution-focused: always try to help before asking clarifying questions.
+
+CRITICAL RULE 2: SANDWICHES AND BURGERS ARE THE SAME
+- WE SELL SANDWICHES AND BURGERS. They are the exact same thing here.
+- IF A CUSTOMER ASKS FOR A SANDWICH, YOU MUST SAY "Ehh akid! Fina n3melak sandwich."
+- NEVER EVER say "we don't have sandwiches". This is strictly forbidden.
+
+CRITICAL RULE 3: CUSTOM INGREDIENTS
+- READ the "AVAILABLE CUSTOM OPTIONS" carefully! 
+- If a customer asks for chicken, turkey, or anything listed there, YOU MUST OFFER IT.
+- Do not say "we only have beef" if chicken is in the options.
+- Never invent ingredients that are not in the lists.
 
 RESTAURANT INFORMATION:
 - Name: Snack Attack
 - Hours: Open every day, 11:00 AM to 11:00 PM
-- Specialty: Burgers, custom build-your-own burgers, snacks
 
 ${menuList}
+${extrasText}
 
 ACTIONS — append silently at the end of your reply when needed:
 
@@ -247,24 +284,19 @@ ACTIONS — append silently at the end of your reply when needed:
    CART_ADD:Exact Item Name
    (Use ONLY for items listed in AVAILABLE MENU ITEMS above)
 
-2. Place a custom burger order:
-   CUSTOM_ORDER:{"bread":"brioche","protein":"beef patty","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special sauce","notes":"","price":12.99}
-   (Use ONLY when customer has described all parts of their custom burger)
+2. Place a custom order:
+   CUSTOM_ORDER:{"bread":"brioche","protein":"beef patty","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special sauce","notes":""}
+   (Use ONLY when customer has described all parts of their custom order)
 
 3. Connect customer to staff:
    NEED_ADMIN:reason
-   Reason options: request (asked for human/waiter/staff), complaint (food or service issue), offensive (rude language)
    (Use ONLY when customer explicitly asks for a person, or has a serious complaint)
 
-IMPORTANT RULES:
-- Never invent or suggest items not listed in AVAILABLE MENU ITEMS.
-- For custom burgers, collect all details first (bread, protein, cheese, veggies, sauce) before using CUSTOM_ORDER.
-  If any detail is missing, ask for it first.
+IMPORTANT RULES FOR ACTIONS:
+- For custom orders, collect all details first (bread, protein, cheese, veggies, sauce) before using CUSTOM_ORDER. If any detail is missing, ask for it first.
 - One CART_ADD per message maximum.
 - Never combine CART_ADD and CUSTOM_ORDER in the same response.
-- Do not explain or mention the action tags to the customer — they are invisible backend signals.
-- If the customer seems confused or unhappy, try to resolve it yourself before escalating.`;
-
+- Do not explain or mention the action tags to the customer — they are invisible backend signals.`;
   try {
     const mapped = messages.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
