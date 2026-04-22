@@ -3,11 +3,11 @@ const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
 const pool = require('./db');
-
+const path = require("path");
 const app = express();
 app.use(cors());
 app.use(express.json());
-
+app.use("/images", express.static(path.join(__dirname, "images")));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
