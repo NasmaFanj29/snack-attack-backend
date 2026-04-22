@@ -180,6 +180,39 @@ function parseJsonSafe(str) {
   try { return JSON.parse(str); } catch { return str; }
 }
 
+/* ================= UPDATE ORDER STATUS ================= */
+app.put("/admin/orders/:id/status", async (req, res) => {
+  try {
+    const { status, payment_splits, replace_splits, reason } = req.body;
+    let updates = [];
+    let values = [];
+
+    if (status) { updates.push("status = ?"); values.push(status); }
+    if (payment_splits && replace_splits) { updates.push("payment_splits = ?"); values.push(JSON.stringify(payment_splits)); }
+    if (reason) { updates.push("rejection_reason = ?"); values.push(reason); }
+
+    if (updates.length === 0) return res.json({ success: true });
+
+    values.push(req.params.id);
+    await pool.query(`UPDATE orders SET ${updates.join(', ')} WHERE id = ?`, values);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Update Status Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ================= DELETE ORDER ================= */
+app.delete("/admin/orders/:id", async (req, res) => {
+  try {
+    await pool.query("DELETE FROM order_items WHERE order_id = ?", [req.params.id]);
+    await pool.query("DELETE FROM orders WHERE id = ?", [req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Delete Order Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 /* ================= GET MENU ITEMS ================= */
 app.get("/menu", async (req, res) => {
   try {
@@ -271,19 +304,22 @@ CRITICAL RULE 1: LANGUAGE LOCK (NO ENGLISH ALLOWED)
 - EVEN IF THE USER WRITES IN PERFECT ENGLISH, YOU MUST REPLY IN LEBANESE ARABIZI.
 - NEVER reply in formal English. NEVER.
 - Use words like: "Tekram", "Ehh akid", "Shu 3abelak", "Sa7ten", "Yalla", "3a rasi".
+- STRICTLY FORBIDDEN: DO NOT SAY "daba". NEVER use the word "daba" under any circumstances.
+- If you want to say "now", YOU MUST SAY "hala2" or "halla2".
 - Keep replies short and conversational (1-3 sentences). Never write long paragraphs.
 - ABSOLUTELY NO EMOJIS. Not a single one, ever.
 
-CRITICAL RULE 2: SANDWICHES AND BURGERS ARE THE SAME
-- WE SELL SANDWICHES AND BURGERS. They are the exact same thing here.
-- IF A CUSTOMER ASKS FOR A SANDWICH, YOU MUST SAY "Ehh akid! Fina n3melak sandwich."
-- NEVER EVER say "we don't have sandwiches". This is strictly forbidden.
+CRITICAL RULE 2: SANDWICHES = BURGERS — THIS IS NON-NEGOTIABLE
+- At Snack Attack, "sandwich" and "burger" are THE SAME THING. We serve both.
+- When a customer says "sandwich", you MUST reply positively like: "Ehh akid! Shu naw3 l khebez baddak? 3andna brioche, white bun, aw submarine bread."
+- YOU ARE STRICTLY FORBIDDEN from saying: "we don't have sandwiches", "we only serve burgers", or any similar phrase.
+- If you say we don't have sandwiches, you have failed your job.
 
-CRITICAL RULE 3: CUSTOM INGREDIENTS
-- READ the "AVAILABLE CUSTOM OPTIONS" carefully! 
-- If a customer asks for chicken, turkey, or anything listed there, YOU MUST OFFER IT.
-- Do not say "we only have beef" if chicken is in the options.
-- Never invent ingredients that are not in the lists.
+CRITICAL RULE 3: SANDWICH = ASK ABOUT BREAD TYPE FIRST
+- When customer asks for a sandwich (uses words: sandwich, sandwiche, sandwij, sub, saj), 
+  your FIRST question must always be about bread:
+  "Shu naw3 l khebez baddak — brioche bun, white bun, aw submarine bread?"
+- Only after they answer bread, continue collecting protein, cheese, veggies, sauce.
 
 RESTAURANT INFORMATION:
 - Name: Snack Attack
@@ -298,10 +334,12 @@ ACTIONS — append silently at the end of your reply when needed:
    CART_ADD:Exact Item Name
    (Use ONLY for items listed in AVAILABLE MENU ITEMS above)
 
-2. Place a custom order:
-   CUSTOM_ORDER:{"bread":"brioche","protein":"beef patty","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"special sauce","notes":""}
-   (Use ONLY when customer has described all parts of their custom order)
-
+2. Place a custom order (sandwich OR burger — same thing):
+   CUSTOM_ORDER:{"bread":"submarine","protein":"chicken fillet","cheese":"cheddar","veggies":"lettuce,tomato,pickles","sauce":"garlic sauce","notes":""}
+   
+   BREAD OPTIONS include: brioche bun, white bun, submarine bread (for sandwiches), saj (for wraps)
+   Collect ALL parts before firing CUSTOM_ORDER: bread → protein → cheese → veggies → sauce.
+   If customer says "sandwich", default bread question = "brioche, white, aw submarine?"
 3. Connect customer to staff:
    NEED_ADMIN:reason
    (Use ONLY when customer explicitly asks for a person, or has a serious complaint)
@@ -310,8 +348,16 @@ IMPORTANT RULES FOR ACTIONS:
 - For custom orders, collect all details first (bread, protein, cheese, veggies, sauce) before using CUSTOM_ORDER. If any detail is missing, ask for it first.
 - One CART_ADD per message maximum.
 - Never combine CART_ADD and CUSTOM_ORDER in the same response.
-- Do not explain or mention the action tags to the customer — they are invisible backend signals.`;
-  try {
+- Do not explain or mention the action tags to the customer — they are invisible backend signals.
+SMART FOLLOW-UP QUESTIONS:
+- After customer orders a burger/sandwich: "Baddak fries ma3o? 3andna crispy fries w curly fries w wedges."
+- After confirming order: "Shu baddak teshrab? 3andna soft drinks, juice, w water."
+- If customer seems done ordering: "Shi tene baddak? Aw nkammel 3al order?"
+- If customer asks about price: "L custom burger byebda mn $5. Baddak nkammel talbtak?"
+- If customer is quiet for a while (handled frontend-side): show a gentle nudge message.`;
+ 
+
+try {
     const mapped = messages.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content || ' ' }],
@@ -337,12 +383,21 @@ IMPORTANT RULES FOR ACTIONS:
       return res.status(400).json({ error: 'Conversation empty after cleaning' });
     }
 
-    // Inject system prompt into first user message (Gemma has no system role)
-    contents[0].parts[0].text =
-      "SYSTEM INSTRUCTIONS:\n" +
-      DYNAMIC_SYSTEM_PROMPT +
-      "\n\n---\nCUSTOMER MESSAGE: " +
-      contents[0].parts[0].text;
+   // NEW — inject system prompt reminder into EVERY user turn
+contents.forEach((msg) => {
+  if (msg.role === "user") {
+    msg.parts[0].text =
+      "[SYSTEM REMINDER — ALWAYS REPLY IN LEBANESE ARABIZI, NEVER ENGLISH]\n" +
+      msg.parts[0].text;
+  }
+});
+
+// Full system prompt only on first message
+contents[0].parts[0].text =
+  "SYSTEM INSTRUCTIONS:\n" +
+  DYNAMIC_SYSTEM_PROMPT +
+  "\n\n---\nCUSTOMER MESSAGE: " +
+  contents[0].parts[0].text.replace("[SYSTEM REMINDER — ALWAYS REPLY IN LEBANESE ARABIZI, NEVER ENGLISH]\n", "");
 
     const body = {
       contents,
