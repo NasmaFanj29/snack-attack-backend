@@ -234,8 +234,30 @@ io.on("connection", (socket) => console.log("Socket connected:", socket.id));
 //  /api/chat  —  Gemma 3 (27B)
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+//  /api/chat  —  Gemma 3 (27B)  — FIXED language detection
+// ═══════════════════════════════════════════════════════════════════
+
 const GEMINI_MODEL = 'gemma-3-27b-it';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+
+// ── 3-way language detector ──────────────────────────────────────
+// Returns: 'arabic' | 'franco' | 'english'
+function detectLanguage(text) {
+  // 1. Arabic Unicode letters present → Arabic mode
+  if (/[\u0600-\u06FF]/.test(text)) return 'arabic';
+
+  // 2. Franco Lebanese markers:
+  //    - Numbers used as Arabic sounds: 3(ع) 2(أ) 7(ح) 5(خ) 8(غ) 6(ط) 4(غ)
+  //    - Common Lebanese Franco words
+  const francoNumbers = /\b\w*[32785640]\w*\b/.test(text);
+  const francoWords   = /\b(shu|yalla|kif|kifak|kifek|marhaba|ahla|ahlan|salam|3andi|3andak|baddak|bade|badi|hala2|halla2|hl2|kteer|kter|ktir|ma3|m3|la2|laa|fi|men|min|mn|3al|3l|lal|bl|bel|bil|byeji|bes|bas|shi|hek|inno|enno|yane|ya3ne|iza|lamma|kaman|kmn|3am|mshe|raye7|jaye|nhar|kel|eno|ana|inta|hiye|huwwe|howwe|mish|msh|ta2|2abel|sa7|ma7al|saret|7elo|7elwe|3anjad|tfaddal|yislam|yalla|zo2|wlek|wle|ya|habibi|habibte|ma32oul|2akid|akid|mbala|tfe|yiii|awww|heik|heidk)\b/i.test(text);
+
+  if (francoNumbers || francoWords) return 'franco';
+
+  // 3. Otherwise pure English
+  return 'english';
+}
 
 app.post('/api/chat', async (req, res) => {
   const { messages, menuItems } = req.body;
@@ -245,15 +267,11 @@ app.post('/api/chat', async (req, res) => {
   }
 
   // ── 1. Fetch Custom Options from Database ─────────────────────
- let extrasText = "AVAILABLE CUSTOM OPTIONS (Bread, Protein, Cheese, Veggies, Sauce):\n";
+  let extrasText = "AVAILABLE CUSTOM OPTIONS (Bread, Protein, Cheese, Veggies, Sauce):\n";
   try {
-    // T2akkadi mn esem l table hon b phpMyAdmin!
-    const [extras] = await pool.query("SELECT category, name FROM extra_options"); 
-    
+    const [extras] = await pool.query("SELECT category, name FROM extra_options");
     if (extras.length > 0) {
-      extras.forEach(ext => {
-        extrasText += `- ${ext.category}: ${ext.name}\n`;
-      });
+      extras.forEach(ext => { extrasText += `- ${ext.category}: ${ext.name}\n`; });
     } else {
       extrasText += "Custom options are currently unavailable.\n";
     }
@@ -261,83 +279,60 @@ app.post('/api/chat', async (req, res) => {
     console.error("❌ Error fetching extras:", err.message);
   }
 
-  // ZIDI HAYDA L SATR LA TSHOUFI SHOU 3M YOUSAL LAL AI:
-  console.log("🍔 EXTRAS SENT TO AI: \n", extrasText);
-
   // ── 2. Build dynamic menu list ────────────────────────────────
   let menuList = "AVAILABLE MENU ITEMS:\n";
   if (menuItems && menuItems.length > 0) {
-    menuItems.forEach(item => {
-      menuList += `- ${item.name} — $${item.price}\n`;
-    });
+    menuItems.forEach(item => { menuList += `- ${item.name} — $${item.price}\n`; });
   } else {
     menuList += "Menu is currently unavailable.\n";
   }
 
-  // ── System Prompt ────────────────────────────────────────────
- // ── System Prompt ────────────────────────────────────────────
-// ── System Prompt ────────────────────────────────────────────
-  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", the friendly and helpful assistant at Snack Attack restaurant.
+  // ── 3. System Prompt ──────────────────────────────────────────
+  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", the friendly assistant at Snack Attack restaurant in Lebanon.
 
-CRITICAL RULE 1: STRICT LANGUAGE ISOLATION
-- You MUST match the user's alphabet exactly. NEVER MIX ARABIC AND ENGLISH LETTERS IN THE SAME MESSAGE.
-- If user writes in Arabic letters (عربي): Reply ONLY using Arabic letters. Example: "أهلاً فيك! شو عبالك تاكل؟"
-- If user writes in English/Franco: Reply ONLY using English letters. Example: "Ahlan fik! Shu 3abelak?"
-- Always use Lebanese Dialect. NEVER use formal Fusha.
-- NEVER say "daba".
-- No emojis.
+════════════════════════════════════════
+LANGUAGE RULE — THE MOST IMPORTANT RULE
+════════════════════════════════════════
+You will receive a [LANGUAGE:xxx] tag before every user message. You MUST reply ONLY in that language.
 
-CRITICAL RULE 2: SANDWICH = BURGER
-- They are the same thing. Don't say you don't have sandwiches.
-- If they ask for a sandwich/burger, FIRST ask for bread type.
-  - Arabic: "أكيد! شو نوع الخبز بدك؟ بريوش، أبيض، أو سابمرين؟"
-  - Franco: "Ehh akid! Shu naw3 l khebez baddak — brioche bun, white bun, aw submarine bread?"
-  CRITICAL RULE 3: SANDWICH = ASK ABOUT BREAD TYPE FIRST
-- When customer asks for a sandwich (uses words: sandwich, sandwiche, sandwij, sub, saj, ساندويش), 
-  your FIRST question must always be about bread:
-  "Shu naw3 l khebez baddak — brioche bun, white bun, aw submarine bread?"
-- Only after they answer bread, continue collecting protein, cheese, veggies, sauce.
+[LANGUAGE:ARABIC]  → Reply using ONLY Arabic letters (أحرف عربية فقط). Zero English or Franco letters allowed.
+[LANGUAGE:FRANCO]  → Reply using ONLY Franco Lebanese (Latin letters + numbers like 3,2,7). Zero Arabic letters allowed.
+[LANGUAGE:ENGLISH] → Reply using ONLY pure English. Zero Arabic or Franco words allowed.
+
+This rule overrides everything. Even if the previous messages were in another language, always match the LATEST [LANGUAGE:xxx] tag.
+Never mix. Never explain. Just reply in the correct language.
+════════════════════════════════════════
 
 RESTAURANT INFORMATION:
-- Name: Snack Attack
+- Name: Snack Attack, Hamra - Bliss Street
 - Hours: Open every day, 11:00 AM to 11:00 PM
+- Phone: 03 231 506
 
 ${menuList}
 ${extrasText}
 
-ACTIONS — append silently at the end of your reply when needed:
+CORE RULES:
+1. Always use Lebanese dialect. Never use Fusha Arabic. Never say "دابا" or "واش".
+2. SANDWICH = BURGER. They are the same thing. Never say you don't have sandwiches.
+3. When customer asks for a sandwich/burger, FIRST ask for bread type only. Then collect: protein → cheese → veggies → sauce.
+4. After order confirmed, ask: "Baddak fries ma3o?" then "Shu baddak teshrab?"
+5. No emojis. Keep replies short and friendly.
+
+ACTIONS — append silently at end of reply when needed:
 
 1. Add a menu item to cart:
    CART_ADD:Exact Item Name
-   (Use ONLY for items listed in AVAILABLE MENU ITEMS above)
 
-2. Place a custom order (sandwich OR burger — same thing):
-   CUSTOM_ORDER:{"bread":"submarine","protein":"chicken fillet","cheese":"cheddar","veggies":"lettuce,tomato,pickles","sauce":"garlic sauce","notes":""}
-   
-   BREAD OPTIONS include: brioche bun, white bun, submarine bread (for sandwiches), saj (for wraps)
-   Collect ALL parts before firing CUSTOM_ORDER: bread → protein → cheese → veggies → sauce.
-   If customer says "sandwich", default bread question = "brioche, white, aw submarine?"
+2. Place a custom order (collect ALL details first):
+   CUSTOM_ORDER:{"bread":"brioche bun","protein":"beef patty","cheese":"cheddar","veggies":"lettuce,tomato","sauce":"garlic sauce","notes":""}
 
-3. Connect customer to staff:
+3. Connect to staff:
    NEED_ADMIN:reason
+   (reasons: confused / complaint / request / offensive)
 
-   SMART FOLLOW-UP QUESTIONS:
-- If Arabic: "بدك بطاطا معو؟ عنا كرسبي و ويدجز." OR "شو بتشرب؟"
-- If Franco: "Baddak fries ma3o?" OR "Shu baddak teshrab?"
+IMPORTANT: Never explain or mention the action tags to the customer.`;
 
-IMPORTANT RULES FOR ACTIONS:
-- For custom orders, collect all details first before using CUSTOM_ORDER.
-- One CART_ADD per message maximum.
-- Never combine CART_ADD and CUSTOM_ORDER in the same response.
-- Do not explain or mention the action tags to the customer.
-
-SMART FOLLOW-UP QUESTIONS:
-- After customer orders: "Baddak fries ma3o? 3andna crispy fries w curly fries w wedges." (بدك بطاطا معو؟)
-- After confirming order: "Shu baddak teshrab? 3andna soft drinks, juice, w water." (شو بتشرب؟)
-- If customer asks about price: "L custom burger byebda mn $5." (بيبلش حقو من ٥ دولار)`;
- 
-
-try {
+  try {
     const mapped = messages.map((m) => ({
       role: m.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: m.content || ' ' }],
@@ -363,37 +358,34 @@ try {
       return res.status(400).json({ error: 'Conversation empty after cleaning' });
     }
 
- // 🟢 NEW: Function to check if text has Arabic letters
-   // 🟢 Function to check if text has Arabic letters
-    const containsArabic = (text) => /[\u0600-\u06FF]/.test(text);
-
-    // 🟢 Inject dynamic system reminder into EVERY user turn
+    // ── Inject [LANGUAGE:xxx] tag into every user turn ────────────
+    // This is the key fix: clear, explicit tag the AI cannot ignore
     contents.forEach((msg) => {
-      if (msg.role === "user") {
-        const isArabic = containsArabic(msg.parts[0].text);
-        
-        // Very aggressive boundary so the AI doesn't mix them
-        const languageCommand = isArabic
-          ? "[CRITICAL: USER WROTE IN ARABIC. YOU MUST USE 100% ARABIC LETTERS (أحرف عربية). DO NOT WRITE A SINGLE ENGLISH LETTER. DO NOT USE FRANCO.]\n"
-          : "[CRITICAL: USER WROTE IN FRANCO. YOU MUST USE 100% ENGLISH LETTERS (Franco/Arabizi). DO NOT WRITE A SINGLE ARABIC LETTER.]\n";
-        
-        msg.parts[0].text = languageCommand + msg.parts[0].text;
+      if (msg.role === 'user') {
+        const lang = detectLanguage(msg.parts[0].text);
+        const tag  = lang === 'arabic'  ? '[LANGUAGE:ARABIC] — Reply in Arabic letters ONLY. No Franco. No English.\n'
+                   : lang === 'franco'  ? '[LANGUAGE:FRANCO] — Reply in Franco Lebanese ONLY. No Arabic letters. No pure English.\n'
+                   :                      '[LANGUAGE:ENGLISH] — Reply in pure English ONLY. No Arabic. No Franco.\n';
+        msg.parts[0].text = tag + msg.parts[0].text;
+        console.log(`🌐 Detected: ${lang.toUpperCase()} for: "${msg.parts[0].text.slice(0, 60)}..."`);
       }
     });
 
-    // 🟢 Clean up the first message so it doesn't look messy to the AI
-    const firstMsgText = contents[0].parts[0].text.replace(/\[CRITICAL:.*?\]\n/, "");
+    // Inject system prompt into the first message
+    const firstText = contents[0].parts[0].text.replace(/\[LANGUAGE:.*?\].*?\n/, '');
+    const langTag   = contents[0].parts[0].text.match(/\[LANGUAGE:.*?\].*?\n/)?.[0] || '';
     contents[0].parts[0].text =
       "SYSTEM INSTRUCTIONS:\n" +
       DYNAMIC_SYSTEM_PROMPT +
-      "\n\n---\nCUSTOMER MESSAGE: " +
-      firstMsgText;
-
+      "\n\n---\n" +
+      langTag +
+      "CUSTOMER MESSAGE: " +
+      firstText;
 
     const body = {
       contents,
       generationConfig: {
-        temperature: 0.6,
+        temperature: 0.5,
         maxOutputTokens: 400,
       },
     };
