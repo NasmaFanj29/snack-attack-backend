@@ -20,7 +20,7 @@ const io = new Server(server, { cors: { origin: "*" } });
    PLACE ORDER
    ================================================================ */
 app.post("/place-order", async (req, res) => {
-  const { customer, table_id, total_price, items } = req.body;
+  const { customer, table_id, total_price, items, payment_splits } = req.body;
   if (!items || !Array.isArray(items) || items.length === 0)
     return res.status(400).json({ error: "No items in order" });
   if (isNaN(Number(total_price)) || Number(total_price) <= 0)
@@ -33,9 +33,8 @@ app.post("/place-order", async (req, res) => {
     await conn.beginTransaction();
 
     // Find or create user
-    let [userRows] = await conn.query(
-      "SELECT user_id FROM users WHERE phone_number = ?", [phone]
-    );
+    const name  = customer?.name  || "Guest";
+    const phone = customer?.phone || "0000000000";
     let userId;
     if (!userRows.length) {
       const [u] = await conn.query(
