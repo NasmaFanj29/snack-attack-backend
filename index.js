@@ -32,19 +32,24 @@ app.post("/place-order", async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // Find or create user
     const name  = customer?.name  || "Guest";
-    const phone = customer?.phone || "0000000000";
-    let userId;
-    if (!userRows.length) {
-      const [u] = await conn.query(
-        "INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)",
-        [name, phone]
-      );
-      userId = u.insertId;
-    } else {
-      userId = userRows[0].user_id;
-    }
+const phone = customer?.phone || "0000000000";
+
+// ✅ ADD THIS LINE BACK
+let [userRows] = await conn.query(
+  "SELECT user_id FROM users WHERE phone_number = ?", [phone]
+);
+
+let userId;
+if (!userRows.length) {
+  const [u] = await conn.query(
+    "INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)",
+    [name, phone]
+  );
+  userId = u.insertId;
+} else {
+  userId = userRows[0].user_id;
+}
 
     // Create order record
     const [order] = await conn.query(
