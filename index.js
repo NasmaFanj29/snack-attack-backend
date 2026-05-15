@@ -7,7 +7,7 @@ const pool = require('./db');
 const path = require("path");
 const Stripe = require("stripe");
 const app = express();
-console.log(process.env.STRIPE_SECRET_KEY);
+
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 app.use(cors());
 app.use(express.json());
@@ -311,17 +311,17 @@ app.post('/api/chat', async (req, res) => {
   }
 
   // ── Fetch extras from DB ──────────────────────────────────────
-  let extrasText = "AVAILABLE CUSTOM OPTIONS (Bread, Protein, Cheese, Veggies, Sauce):\n";
-  try {
-    const [extras] = await pool.query("SELECT category, name FROM extra_options");
-    if (extras.length > 0) {
-      extras.forEach(ext => { extrasText += `- ${ext.category}: ${ext.name}\n`; });
-    } else {
-      extrasText += "Custom options currently unavailable.\n";
-    }
-  } catch (err) {
-    console.error("❌ Error fetching extras:", err.message);
+ let extrasText = "AVAILABLE ADD-ON EXTRAS:\n";
+try {
+  const [extras] = await pool.query("SELECT name, price FROM extra_options");
+  if (extras.length > 0) {
+    extras.forEach(ext => { extrasText += `- ${ext.name} (+$${ext.price})\n`; });
+  } else {
+    extrasText += "No extras currently available.\n";
   }
+} catch (err) {
+  console.error("❌ Error fetching extras:", err.message);
+}
 
   // ── Build menu list ───────────────────────────────────────────
   let menuList = "AVAILABLE MENU ITEMS:\n";
