@@ -233,6 +233,15 @@ app.get("/extras", async (req, res) => {
   res.json(extras);
 });
 
+// ضيفه بعد route الـ /extras الموجود
+app.get("/item-extras/:id", async (req, res) => {
+  try {
+    const [extras] = await pool.query("SELECT * FROM extra_options");
+    res.json(extras);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 /* ================================================================
    GET SINGLE ORDER
    ================================================================ */
@@ -280,17 +289,6 @@ function parseJsonSafe(str) {
   try { return JSON.parse(str); } catch { return str; }
 }
 
-/* ================================================================
-   CHAT  —  Gemma 3 (27B) via Gemini API
-   ================================================================ */
-
-const GEMINI_MODEL = 'gemma-3-27b-it';
-const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-
-/**
- * Detect language from customer message.
- * Returns: 'arabic' | 'franco' | 'english'
- */
 function detectLanguage(text) {
   // Arabic Unicode block
   if (/[\u0600-\u06FF]/.test(text)) return 'arabic';
@@ -312,14 +310,14 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'messages array required' });
   }
 
-  // ── Fetch available extras from DB ────────────────────────────
+  // ── Fetch extras from DB ──────────────────────────────────────
   let extrasText = "AVAILABLE CUSTOM OPTIONS (Bread, Protein, Cheese, Veggies, Sauce):\n";
   try {
     const [extras] = await pool.query("SELECT category, name FROM extra_options");
     if (extras.length > 0) {
       extras.forEach(ext => { extrasText += `- ${ext.category}: ${ext.name}\n`; });
     } else {
-      extrasText += "Custom options are currently unavailable.\n";
+      extrasText += "Custom options currently unavailable.\n";
     }
   } catch (err) {
     console.error("❌ Error fetching extras:", err.message);
@@ -330,20 +328,20 @@ app.post('/api/chat', async (req, res) => {
   if (menuItems && menuItems.length > 0) {
     menuItems.forEach(item => { menuList += `- ${item.name} — $${item.price}\n`; });
   } else {
-    menuList += "Menu is currently unavailable.\n";
+    menuList += "Menu currently unavailable.\n";
   }
 
   // ── System prompt ─────────────────────────────────────────────
-  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", the friendly assistant at Snack Attack restaurant in Lebanon.
+  const SYSTEM_PROMPT = `You are "Sami", the friendly assistant at Snack Attack restaurant in Lebanon.
 
 ════════════════════════════════════════
 LANGUAGE RULE — HIGHEST PRIORITY
 ════════════════════════════════════════
 You will receive a [LANGUAGE:xxx] tag before every user message. Always reply in that language.
 
-[LANGUAGE:ARABIC]  → Arabic letters only (أحرف عربية). No English or Franco.
+[LANGUAGE:ARABIC]  → Arabic letters only. No English or Franco.
 [LANGUAGE:FRANCO]  → Franco Lebanese only (Latin + numbers like 3,2,7). No Arabic letters.
-[LANGUAGE:ENGLISH] → Pure English only. No Arabic or Franco.
+[LANGUAGE:ENGLISH] → Pure English only.
 
 Always match the LATEST [LANGUAGE:xxx] tag. Never mix languages.
 ════════════════════════════════════════
@@ -366,35 +364,12 @@ STEP 1 — COLLECT ALL DETAILS (one question at a time):
 
 STEP 2 — CONFIRMATION (MANDATORY before any action):
   Once you have everything, show a clear summary and ask for confirmation.
-  Example (Franco):
-    "So checkup 3al sari3:
-     - Sandwich: brioche bun + beef patty + cheddar + lettuce & tomato + garlic sauce
-     - Fries: yes
-     - Drink: Pepsi
-     Mashi heik?"
 
-  Example (Arabic):
-    "للتأكيد قبل ما نكمل:
-     - ساندويش: خبز بريوش + لحمة + شيدر + خس وبندورة + صوص ثوم
-     - فريز: آه
-     - مشروب: بيبسي
-     هيك منيح؟"
-
-  Example (English):
-    "Let me confirm your order before we proceed:
-     - Sandwich: brioche bun + beef patty + cheddar + lettuce & tomato + garlic sauce
-     - Fries: yes
-     - Drink: Pepsi
-     Does that look right?"
-
-STEP 3 — SEND ACTION + PROFESSIONAL SUMMARY (only after customer confirms):
-  Append the CUSTOM_ORDER action, then immediately send a professional order summary.
-
-  The summary must look like this (adapt language accordingly):
+STEP 3 — SEND ACTION + SUMMARY (only after customer confirms):
+  Append CUSTOM_ORDER action then show the receipt box.
 
   Franco example:
-    "Perfect! Talab l order. Hayda moukhtasar talab-ak:
-
+    "Perfect! Hayda moukhtasar talab-ak:
      ┌─────────────────────────────┐
      │  SNACK ATTACK — TABLE [X]   │
      ├─────────────────────────────┤
@@ -404,142 +379,64 @@ STEP 3 — SEND ACTION + PROFESSIONAL SUMMARY (only after customer confirms):
      │  • Cheese : Cheddar         │
      │  • Veggies: Lettuce, Tomato │
      │  • Sauce  : Garlic Sauce    │
-     │                             │
      │  + Fries                    │
      │  + Pepsi                    │
      └─────────────────────────────┘
      Mashkour 3ala talabak! Ra7 youssal 2ariban."
 
-  English example:
-    "All set! Here's your order summary:
-
-     ┌─────────────────────────────┐
-     │  SNACK ATTACK — TABLE [X]   │
-     ├─────────────────────────────┤
-     │  Custom Burger              │
-     │  • Bread : Brioche Bun      │
-     │  • Protein: Beef Patty      │
-     │  • Cheese : Cheddar         │
-     │  • Veggies: Lettuce, Tomato │
-     │  • Sauce  : Garlic Sauce    │
-     │                             │
-     │  + Fries                    │
-     │  + Pepsi                    │
-     └─────────────────────────────┘
-     Thank you! Your order is on its way."
-
-  Arabic example:
-    "تمام! هيدا ملخص طلبك:
-
-     ┌─────────────────────────────┐
-     │  SNACK ATTACK — طاولة [X]   │
-     ├─────────────────────────────┤
-     │  برغر مخصص                  │
-     │  • خبز   : بريوش            │
-     │  • لحمة  : بيف باتي         │
-     │  • جبنة  : شيدر             │
-     │  • خضار  : خس وبندورة      │
-     │  • صوص   : ثوم              │
-     │                             │
-     │  + فريز                     │
-     │  + بيبسي                    │
-     └─────────────────────────────┘
-     شكراً لطلبك! رح يوصل قريباً."
-
 IMPORTANT RULES:
-1. NEVER skip the confirmation step (Step 2). Always ask before placing.
-2. NEVER place the order if the customer hasn't confirmed yet.
-3. If customer says "no" or wants to change something, go back and ask what to fix.
-4. Always use Lebanese dialect. Never use Fusha. Never say "دابا" or "واش".
-5. SANDWICH = BURGER. Same thing. Never say you don't have sandwiches.
-6. No emojis. Keep replies short and clear.
+1. NEVER skip the confirmation step. Always ask before placing.
+2. NEVER place the order if the customer hasn't confirmed.
+3. SANDWICH = BURGER. Same thing. Never say you don't have sandwiches.
+4. Always use Lebanese dialect. Never use Fusha.
+5. No emojis. Keep replies short and clear.
 
 ═══════════════════
-ACTIONS (silent — append at end of message, never explain to customer)
+ACTIONS (append at end of message, never explain to customer)
 ═══════════════════
+Add regular item:        CART_ADD:Exact Item Name
+Place confirmed order:   CUSTOM_ORDER:{"bread":"...","protein":"...","cheese":"...","veggies":"...","sauce":"...","notes":""}
+Call staff:              NEED_ADMIN:reason   (reasons: confused / complaint / request / offensive)`;
 
-Add a regular menu item to cart:
-  CART_ADD:Exact Item Name
 
-Place a confirmed custom order:
-  CUSTOM_ORDER:{"bread":"...","protein":"...","cheese":"...","veggies":"...","sauce":"...","notes":""}
-
-Call staff:
-  NEED_ADMIN:reason
-  (reasons: confused / complaint / request / offensive)`;
+  // ── Inject language tag into user messages ────────────────────
+  const processedMessages = messages.map((msg) => {
+    if (msg.role !== 'user') return msg;
+    const lang = detectLanguage(msg.content);
+    const tag =
+      lang === 'arabic'  ? '[LANGUAGE:ARABIC] — Reply in Arabic ONLY.\n' :
+      lang === 'franco'  ? '[LANGUAGE:FRANCO] — Reply in Franco Lebanese ONLY.\n' :
+                           '[LANGUAGE:ENGLISH] — Reply in English ONLY.\n';
+    return { role: 'user', content: tag + msg.content };
+  });
 
   try {
-    // Map messages to Gemini format
-    const mapped = messages.map((m) => ({
-      role:  m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content || ' ' }],
-    }));
-
-    // Merge consecutive same-role turns (Gemma API requirement)
-    const contents = [];
-    for (const msg of mapped) {
-      const last = contents[contents.length - 1];
-      if (last && last.role === msg.role) {
-        last.parts[0].text += '\n' + msg.parts[0].text;
-      } else {
-        contents.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
-      }
-    }
-
-    // Conversation must start with a user turn
-    while (contents.length > 0 && contents[0].role !== 'user') contents.shift();
-
-    if (contents.length === 0) {
-      return res.status(400).json({ error: 'Conversation empty after cleaning' });
-    }
-
-    // Inject language tag into every user turn
-    contents.forEach((msg) => {
-      if (msg.role === 'user') {
-        const lang = detectLanguage(msg.parts[0].text);
-        const tag  = lang === 'arabic'
-          ? '[LANGUAGE:ARABIC] — Reply in Arabic letters ONLY.\n'
-          : lang === 'franco'
-          ? '[LANGUAGE:FRANCO] — Reply in Franco Lebanese ONLY.\n'
-          : '[LANGUAGE:ENGLISH] — Reply in pure English ONLY.\n';
-
-        msg.parts[0].text = tag + msg.parts[0].text;
-        console.log(`🌐 Language: ${lang.toUpperCase()} — "${msg.parts[0].text.slice(0, 60)}..."`);
-      }
-    });
-
-    // Inject system prompt into the first user message
-    const firstText = contents[0].parts[0].text.replace(/\[LANGUAGE:.*?\].*?\n/, '');
-    const langTag   = contents[0].parts[0].text.match(/\[LANGUAGE:.*?\].*?\n/)?.[0] || '';
-    contents[0].parts[0].text =
-      "SYSTEM INSTRUCTIONS:\n" + DYNAMIC_SYSTEM_PROMPT +
-      "\n\n---\n" + langTag +
-      "CUSTOMER MESSAGE: " + firstText;
-
-    const body = {
-      contents,
-      generationConfig: {
-        temperature: 0.5,
-        maxOutputTokens: 500, // bumped slightly for summary
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
       },
-    };
-
-    const response = await fetch(GEMINI_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 600,
+        system: SYSTEM_PROMPT,
+        messages: processedMessages,
+      }),
     });
 
     const data = await response.json();
 
     if (!response.ok) {
-      console.error('❌ Gemini API Error:', JSON.stringify(data, null, 2));
-      return res.status(500).json({ error: 'Gemini API error', details: data?.error?.message || data });
+      console.error('❌ Claude API Error:', JSON.stringify(data, null, 2));
+      return res.status(500).json({ error: 'Claude API error', details: data?.error?.message });
     }
 
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!reply) return res.status(500).json({ error: 'Empty response from Gemini' });
+    const reply = data.content?.[0]?.text?.trim();
+    if (!reply) return res.status(500).json({ error: 'Empty response from Claude' });
 
+    console.log(`✅ Claude replied: "${reply.slice(0, 80)}..."`);
     res.json({ reply });
 
   } catch (err) {
@@ -547,70 +444,5 @@ Call staff:
     res.status(500).json({ error: err.message });
   }
 });
-
-/* ================================================================
-   SOCKET.IO — Presence tracking per order room
-   ================================================================ */
-const presence = {}; // { orderId: Set<socketId> }
-
-io.on("connection", (socket) => {
-  socket.on("chatMessage", ({ tableId, message }) => {
-    io.emit(`chat:${tableId}`, message); // broadcast to everyone watching that table
-  });
-
-  socket.on("joinOrder", (orderId) => {
-    socket.join(orderId);
-    if (!presence[orderId]) presence[orderId] = new Set();
-    presence[orderId].add(socket.id);
-    io.to(orderId).emit("presenceUpdate", { count: presence[orderId].size });
-  });
-
-  socket.on("disconnect", () => {
-    for (const [orderId, set] of Object.entries(presence)) {
-      if (set.has(socket.id)) {
-        set.delete(socket.id);
-        if (set.size === 0) delete presence[orderId];
-        else io.to(orderId).emit("presenceUpdate", { count: set.size });
-      }
-    }
-  });
-});
-
-app.post("/create-payment-intent", async (req, res) => {
-  try {
-    const { amount, orderId } = req.body;
-
-    if (!amount || amount <= 0) {
-      return res.status(400).json({
-        error: "Invalid amount",
-      });
-    }
-
-    const paymentIntent =
-      await stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
-        currency: "usd",
-
-        metadata: {
-          orderId: orderId?.toString() || "",
-        },
-
-        automatic_payment_methods: {
-          enabled: true,
-        },
-      });
-
-    res.json({
-      clientSecret: paymentIntent.client_secret,
-    });
-  } catch (err) {
-    console.error(err);
-
-    res.status(500).json({
-      error: err.message,
-    });
-  }
-});
-
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
