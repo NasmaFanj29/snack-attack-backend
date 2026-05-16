@@ -491,10 +491,10 @@ app.post(
 );
 
 /* ================================================================
-   AI CHAT — Gemini 2.5 Flash via Google Generative Language API
+   AI CHAT — Gemini Flash via Google Generative Language API
    Handles: custom burger orders, menu questions, staff escalation
    ================================================================ */
-const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
+const GEMINI_MODEL = "gemini-2.0-flash";
 
 app.post("/api/chat", async (req, res) => {
   if (!process.env.GEMINI_API_KEY) {
@@ -704,7 +704,9 @@ Escalate to staff:
 
     const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-    console.log(`📡 Calling Gemini API (${GEMINI_MODEL}) with ${contents.length} conversation turns...`);
+    console.log(`📡 Calling Gemini API (${GEMINI_MODEL})...`);
+    console.log(`📍 URL base: https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`);
+
 
     let response;
     try {
