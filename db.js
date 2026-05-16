@@ -1,19 +1,34 @@
-const mysql = require('mysql2/promise');
+const mysql = require("mysql2/promise");
+
+const dbHost = process.env.DB_HOST || "localhost";
+const dbPort = Number(process.env.DB_PORT || 3306);
+const dbUser = process.env.DB_USER || "root";
+const dbPassword = process.env.DB_PASSWORD || "";
+const dbName = process.env.DB_DATABASE || process.env.DB_NAME || "defaultdb";
+const requireSsl = process.env.DB_REQUIRE_SSL === "true";
 
 const pool = mysql.createPool({
-  host: "mysql-3d11ed7-fanjnasma-4923.a.aivencloud.com",
-  port: 26847,
-  user: "avnadmin",
-  password: process.env.DB_PASSWORD,
-  database: "defaultdb",
-
-  ssl: {
-    rejectUnauthorized: false
-  },
-
+  host: dbHost,
+  port: dbPort,
+  user: dbUser,
+  password: dbPassword,
+  database: dbName,
+  ssl: requireSsl ? { rejectUnauthorized: process.env.DB_REJECT_UNAUTHORIZED !== "false" } : undefined,
   waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
+  queueLimit: 0,
 });
 
-module.exports = pool;
+const dbWarnings = [];
+if (!process.env.DB_HOST) dbWarnings.push("DB_HOST");
+if (!process.env.DB_USER) dbWarnings.push("DB_USER");
+if (!process.env.DB_PASSWORD) dbWarnings.push("DB_PASSWORD");
+if (!process.env.DB_DATABASE && !process.env.DB_NAME) dbWarnings.push("DB_DATABASE or DB_NAME");
+
+module.exports = Object.assign(pool, {
+  dbName,
+  dbHost,
+  dbPort,
+  dbUser,
+  dbWarnings,
+});

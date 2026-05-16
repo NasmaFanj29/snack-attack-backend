@@ -1,129 +1,322 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
-const cors = require("cors");
-const { Server } = require("socket.io");
-const pool = require('./db');
 const path = require("path");
+const cors = require("cors");
+const helmet = require("helmet");
+const xssClean = require("xss-clean");
+const rateLimit = require("express-rate-limit");
+const jwt = require("jsonwebtoken");
+const { Server } = require("socket.io");
+const pool = require("./db");
 const Stripe = require("stripe");
+
+const {
+  findStaffUser,
+  verifyPassword,
+  signToken,
+  authenticateJWT,
+  requireRole,
+} = require("./middleware/auth");
+
+const {
+  validateRequest,
+  placeOrderValidators,
+  staffLoginValidators,
+  paymentIntentValidators,
+  chatValidators,
+  orderIdParamValidator,
+} = require("./middleware/validation");
+
+const {
+  parseJsonSafe,
+  detectLanguage,
+  sanitizeText,
+  asyncHandler,
+} = require("./utils");
+
 const app = express();
-console.log(process.env.STRIPE_SECRET_KEY);
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-app.use(cors());
-app.use(express.json());
-app.use("/images", express.static(path.join(__dirname, "images")));
+app.set("trust proxy", 1);
+
+const allowedOrigins = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(",").map((origin) => origin.trim()).filter(Boolean)
+  : ["http://localhost:3000"];
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("CORS origin denied"));
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  credentials: true,
+};
+
+app.use(helmet());
+app.use(cors(corsOptions));
+app.use(xssClean());
+app.use(express.json({ limit: "10kb" }));
+app.use("/images", express.static(path.join(__dirname, "images"), { maxAge: "7d", index: false }));
+
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests from this IP, please try again later." },
+});
+app.use(globalLimiter);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many login attempts. Please try again later." },
+});
+
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many chat requests. Slow down a bit." },
+});
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2023-08-16" });
+const webhookEventCache = new Set();
+
+const dbName = pool.dbName;
+const dbHost = pool.dbHost;
+const dbPort = pool.dbPort;
+const dbUser = pool.dbUser;
+const dbWarnings = pool.dbWarnings;
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  console.warn("WARNING: STRIPE_SECRET_KEY is not set. Stripe payments will not work until configured.");
+}
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("WARNING: GEMINI_API_KEY is not set. AI chat will be unavailable until configured.");
+}
+if (process.env.NODE_ENV === "production" && !process.env.CORS_ORIGINS) {
+  console.warn("WARNING: CORS_ORIGINS is not configured. Restrict origins in production.");
+}
+
+function getEnvName() {
+  return process.env.NODE_ENV ? process.env.NODE_ENV.toUpperCase() : "development";
+}
+
+function reportStartupIssues() {
+  const issues = [];
+  if (!process.env.DB_HOST) issues.push("DB_HOST");
+  if (!process.env.DB_USER) issues.push("DB_USER");
+  if (!process.env.DB_PASSWORD) issues.push("DB_PASSWORD");
+  if (!process.env.DB_DATABASE && !process.env.DB_NAME) issues.push("DB_DATABASE or DB_NAME");
+  if (!process.env.JWT_SECRET) issues.push("JWT_SECRET");
+
+  if (issues.length) {
+    console.warn(`WARNING: Backend is starting with missing configuration: ${issues.join(", ")}.`);
+    console.warn("Make sure Render environment variables are configured before using production endpoints.");
+  }
+}
+
+async function verifyDatabaseConnection() {
+  if (!process.env.DB_HOST || !process.env.DB_USER || !process.env.DB_PASSWORD || !(process.env.DB_DATABASE || process.env.DB_NAME)) {
+    console.error("❌ Database connection not attempted because required DB configuration is missing.");
+    return false;
+  }
+
+  try {
+    const conn = await pool.getConnection();
+    await conn.ping();
+    conn.release();
+    console.log(`✅ Database connected successfully to ${dbHost}:${dbPort}/${dbName}`);
+    return true;
+  } catch (err) {
+    const safeMessage = err && err.code ? `${err.code}` : err.message || "Unknown database error";
+    console.error(`❌ Database connection failed: ${safeMessage}`);
+    console.error("Please verify DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_DATABASE/DB_NAME and network access.");
+    return false;
+  }
+}
+
+reportStartupIssues();
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, {
+  cors: {
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+  },
+});
+
+const presence = {}; // { room: Set<socketId> }
+
+function getRoomName(type, id) {
+  return `${type}:${id}`;
+}
+
+function resolveItemId(item) {
+  const id = Number(item.databaseId || item.item_id || item.menu_id || item.id);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+async function fetchMenuItemsByIds(ids) {
+  if (!ids.length) return {};
+  const placeholders = ids.map(() => "?").join(",");
+  const [rows] = await pool.query(
+    `SELECT id, price, name FROM menuitems WHERE id IN (${placeholders})`,
+    ids,
+  );
+  return rows.reduce((map, row) => {
+    map[row.id] = row;
+    return map;
+  }, {});
+}
+
+async function validateOrderItems(conn, items, totalPrice) {
+  const ids = [...new Set(items.filter((item) => !item.isCustom).map(resolveItemId).filter(Boolean))];
+  const menuItemMap = await fetchMenuItemsByIds(ids);
+
+  let computedTotal = 0;
+  const validatedItems = [];
+
+  for (const item of items) {
+    const quantity = Number(item.quantity) || 1;
+    if (quantity < 1) {
+      throw new Error("Each item quantity must be at least 1.");
+    }
+
+    const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
+    const removedExtras = item.removedExtras ? JSON.stringify(item.removedExtras) : null;
+    const specialNote = item.specialNote ? sanitizeText(item.specialNote) : null;
+
+    if (item.isCustom) {
+      const price = Number(item.price);
+      if (isNaN(price) || price <= 0) {
+        throw new Error(`Custom item "${item.name || "custom item"}" requires a valid price.`);
+      }
+      computedTotal += price * quantity;
+      validatedItems.push({
+        itemId: null,
+        name: item.name || "Custom Burger",
+        quantity,
+        price,
+        selectedExtras,
+        removedExtras,
+        specialNote,
+      });
+      continue;
+    }
+
+    const itemId = resolveItemId(item);
+    if (!itemId) {
+      throw new Error(`Missing menu item ID for item "${item.name || "unknown"}".`);
+    }
+
+    const menuItem = menuItemMap[itemId];
+    if (!menuItem) {
+      throw new Error(`Menu item ID ${itemId} not found.`);
+    }
+
+    const price = Number(menuItem.price);
+    if (isNaN(price) || price <= 0) {
+      throw new Error(`Menu item "${menuItem.name || item.name || itemId}" has an invalid price.`);
+    }
+
+    computedTotal += price * quantity;
+    validatedItems.push({
+      itemId,
+      name: menuItem.name || item.name,
+      quantity,
+      price,
+      selectedExtras,
+      removedExtras,
+      specialNote,
+    });
+  }
+
+  if (Math.abs(Number(totalPrice) - computedTotal) > 0.5) {
+    throw new Error("Total price mismatch. The order total must match item prices.");
+  }
+
+  return validatedItems;
+}
 
 /* ================================================================
    PLACE ORDER
    ================================================================ */
-app.post("/place-order", async (req, res) => {
-  const { customer, table_id, total_price, items, payment_splits } = req.body;
-  if (!items || !Array.isArray(items) || items.length === 0)
-    return res.status(400).json({ error: "No items in order" });
-  if (isNaN(Number(total_price)) || Number(total_price) <= 0)
-    return res.status(400).json({ error: "Invalid total price" });
-  console.log("📦 Place Order Request Received");
+app.post(
+  "/place-order",
+  validateRequest(placeOrderValidators),
+  asyncHandler(async (req, res) => {
+    const { customer = {}, table_id, total_price, items, payment_splits } = req.body;
+    const customerName = sanitizeText(customer.name?.trim() || "Guest");
+    const phoneNumber = customer.phone?.trim() || null;
 
-  let conn;
-  try {
-    conn = await pool.getConnection();
-    await conn.beginTransaction();
+    let conn;
+    try {
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
 
-    const name  = customer?.name  || "Guest";
-const phone = customer?.phone || "0000000000";
-
-// ✅ ADD THIS LINE BACK
-let [userRows] = await conn.query(
-  "SELECT user_id FROM users WHERE phone_number = ?", [phone]
-);
-
-let userId;
-if (!userRows.length) {
-  const [u] = await conn.query(
-    "INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)",
-    [name, phone]
-  );
-  userId = u.insertId;
-} else {
-  userId = userRows[0].user_id;
-}
-
-    // Create order record
-    const [order] = await conn.query(
-      `INSERT INTO orders (table_id, total_price, status, user_id, payment_splits)
-       VALUES (?, ?, 'Requested', ?, ?)`,
-      [table_id || 1, total_price, userId, JSON.stringify(payment_splits || [])]
-    );
-    const orderId = order.insertId;
-
-    let savedCount = 0;
-
-    for (const item of items || []) {
-      let itemId = item.databaseId || item.item_id || item.menu_id || item.id || null;
-
-      // Custom burger IDs contain the word "custom" — treat as null
-      if (typeof itemId === 'string' && itemId.includes('custom')) {
-        itemId = null;
+      let userId = null;
+      if (phoneNumber) {
+        const [userRows] = await conn.query("SELECT user_id FROM users WHERE phone_number = ?", [phoneNumber]);
+        if (userRows.length) userId = userRows[0].user_id;
       }
 
-      if (!itemId && item.isCustom) {
-        // Save custom burger with null item_id
-        console.log(`🍔 Custom burger: "${item.name}" — saving with null item_id`);
-        const selectedExtras = item.selectedExtras
-          ? JSON.stringify(item.selectedExtras) : null;
-        const specialNote = item.customOrderData
-          ? `Custom: ${JSON.stringify(item.customOrderData)}`
-          : item.specialNote || null;
+      if (!userId) {
+        const [userResult] = await conn.query(
+          "INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)",
+          [customerName, phoneNumber],
+        );
+        userId = userResult.insertId;
+      }
 
+      const validatedItems = await validateOrderItems(conn, items, total_price);
+
+      const [orderResult] = await conn.query(
+        "INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, 'Requested', ?, ?)",
+        [table_id || 1, Number(total_price), userId, JSON.stringify(payment_splits || [])],
+      );
+      const orderId = orderResult.insertId;
+
+      let savedCount = 0;
+      for (const item of validatedItems) {
         await conn.query(
           `INSERT INTO order_items
              (order_id, item_id, quantity, price_at_time, special_note, removed_extras, selected_extras)
-           VALUES (?, NULL, ?, ?, ?, NULL, ?)`,
-          [orderId, item.quantity || 1, item.price || 12.99, specialNote, selectedExtras]
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [
+            orderId,
+            item.itemId,
+            item.quantity,
+            item.price,
+            item.specialNote,
+            item.removedExtras,
+            item.selectedExtras,
+          ],
         );
-        savedCount++;
-        continue;
+        savedCount += 1;
       }
 
-      if (!itemId) {
-        console.warn(`⚠️ SKIPPED "${item.name}" — no item ID`);
-        continue;
-      }
-
-      // Regular menu item
-      const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
-      const removedExtras  = item.removedExtras  ? JSON.stringify(item.removedExtras)  : null;
-      const specialNote    = item.specialNote    || null;
-
-      await conn.query(
-        `INSERT INTO order_items
-           (order_id, item_id, quantity, price_at_time, special_note, removed_extras, selected_extras)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [orderId, itemId, item.quantity || 1, item.price || 0, specialNote, removedExtras, selectedExtras]
-      );
-      savedCount++;
+      await conn.commit();
+      res.json({ success: true, orderId, savedCount });
+    } catch (err) {
+      if (conn) await conn.rollback();
+      console.error("❌ Place Order Error:", err.message);
+      res.status(500).json({ error: err.message });
+    } finally {
+      if (conn) conn.release();
     }
-
-    await conn.commit();
-    console.log(`✅ Order #${orderId} saved — ${savedCount} item(s).`);
-    res.json({ success: true, orderId });
-
-  } catch (err) {
-    if (conn) await conn.rollback();
-    console.error("❌ Place Order Error:", err.message);
-    res.status(500).json({ error: err.message });
-  } finally {
-    if (conn) conn.release();
-  }
-});
+  }),
+);
 
 /* ================================================================
    ADMIN — GET ALL ORDERS
    ================================================================ */
-app.get("/admin/orders", async (req, res) => {
+app.get("/admin/orders", authenticateJWT, requireRole("admin", "waiter", "kitchen"), async (req, res) => {
   try {
     const [orders] = await pool.query(`
       SELECT o.*, u.full_name, u.phone_number
@@ -134,23 +327,23 @@ app.get("/admin/orders", async (req, res) => {
 
     if (orders.length === 0) return res.json([]);
 
-    const orderIds = orders.map(o => o.id);
+    const orderIds = orders.map((o) => o.id);
 
     const [allItems] = await pool.query(`
       SELECT oi.*, m.name
       FROM order_items oi
       LEFT JOIN menuitems m ON oi.item_id = m.id
-      WHERE oi.order_id IN (${orderIds.map(() => '?').join(',')})
+      WHERE oi.order_id IN (${orderIds.map(() => "?").join(",")})
       ORDER BY oi.order_id, oi.id
     `, orderIds);
 
-    // Group items by order
+    // Group items by order ID
     const itemsMap = {};
-    (allItems || []).forEach(item => {
+    (allItems || []).forEach((item) => {
       const parsed = {
         ...item,
         name: item.name
-          || (item.special_note?.startsWith('Custom:') ? 'Custom Burger' : `Item #${item.item_id || item.id}`),
+          || (item.special_note?.startsWith("Custom:") ? "Custom Burger" : `Item #${item.item_id || item.id}`),
         selected_extras: parseJsonSafe(item.selected_extras) || [],
         removed_extras:  parseJsonSafe(item.removed_extras)  || [],
       };
@@ -158,9 +351,9 @@ app.get("/admin/orders", async (req, res) => {
       itemsMap[item.order_id].push(parsed);
     });
 
-    const result = orders.map(order => ({
+    const result = orders.map((order) => ({
       ...order,
-      full_name:   order.full_name || 'Guest',
+      full_name:   order.full_name || "Guest",
       items:       itemsMap[order.id] || [],
       order_items: itemsMap[order.id] || [],
     }));
@@ -175,20 +368,20 @@ app.get("/admin/orders", async (req, res) => {
 /* ================================================================
    ADMIN — UPDATE ORDER STATUS
    ================================================================ */
-app.put("/admin/orders/:id/status", async (req, res) => {
+app.put("/admin/orders/:id/status", authenticateJWT, requireRole("admin", "waiter", "kitchen"), async (req, res) => {
   try {
     const { status, payment_splits, replace_splits, reason } = req.body;
     const updates = [];
     const values  = [];
 
-    if (status)                         { updates.push("status = ?");           values.push(status); }
+    if (status)                          { updates.push("status = ?");          values.push(status); }
     if (payment_splits && replace_splits){ updates.push("payment_splits = ?");   values.push(JSON.stringify(payment_splits)); }
-    if (reason)                         { updates.push("rejection_reason = ?");  values.push(reason); }
+    if (reason)                          { updates.push("rejection_reason = ?"); values.push(reason); }
 
     if (updates.length === 0) return res.json({ success: true });
 
     values.push(req.params.id);
-    await pool.query(`UPDATE orders SET ${updates.join(', ')} WHERE id = ?`, values);
+    await pool.query(`UPDATE orders SET ${updates.join(", ")} WHERE id = ?`, values);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ Update Status Error:", err);
@@ -199,7 +392,7 @@ app.put("/admin/orders/:id/status", async (req, res) => {
 /* ================================================================
    ADMIN — DELETE ORDER
    ================================================================ */
-app.delete("/admin/orders/:id", async (req, res) => {
+app.delete("/admin/orders/:id", authenticateJWT, requireRole("admin"), async (req, res) => {
   try {
     await pool.query("DELETE FROM order_items WHERE order_id = ?", [req.params.id]);
     await pool.query("DELETE FROM orders WHERE id = ?",            [req.params.id]);
@@ -211,7 +404,7 @@ app.delete("/admin/orders/:id", async (req, res) => {
 });
 
 /* ================================================================
-   GET MENU ITEMS
+   MENU ITEMS
    ================================================================ */
 app.get("/menu", async (req, res) => {
   try {
@@ -224,17 +417,11 @@ app.get("/menu", async (req, res) => {
 });
 
 /* ================================================================
-   GET ITEM EXTRAS
+   EXTRAS
+   Note: extra_options table has columns (id, name, price) only.
+   Both routes return all extras — no per-item filtering needed.
    ================================================================ */
-// ✅ Fix — filter by item if you have a join table, or keep global but be intentional
-// If extras are global (same for all items), just rename the route to /extras
 app.get("/extras", async (req, res) => {
-  const [extras] = await pool.query("SELECT * FROM extra_options");
-  res.json(extras);
-});
-
-// ضيفه بعد route الـ /extras الموجود
-app.get("/item-extras/:id", async (req, res) => {
   try {
     const [extras] = await pool.query("SELECT * FROM extra_options");
     res.json(extras);
@@ -242,11 +429,23 @@ app.get("/item-extras/:id", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+app.get(
+  "/item-extras/:id",
+  validateRequest(orderIdParamValidator),
+  asyncHandler(async (req, res) => {
+    const [extras] = await pool.query("SELECT * FROM extra_options");
+    res.json({ itemId: Number(req.params.id), extras });
+  }),
+);
+
 /* ================================================================
-   GET SINGLE ORDER
+   SINGLE ORDER
    ================================================================ */
-app.get("/orders/:id", async (req, res) => {
-  try {
+app.get(
+  "/orders/:id",
+  validateRequest(orderIdParamValidator),
+  asyncHandler(async (req, res) => {
     const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
     if (!order.length) return res.status(404).json({ error: "Not found" });
 
@@ -257,93 +456,80 @@ app.get("/orders/:id", async (req, res) => {
       WHERE oi.order_id = ?
     `, [req.params.id]);
 
-    const parsedItems = items.map(item => ({
+    const parsedItems = items.map((item) => ({
       ...item,
       selected_extras: parseJsonSafe(item.selected_extras),
       removed_extras:  parseJsonSafe(item.removed_extras),
     }));
 
     res.json({ order: order[0], items: parsedItems });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-// ✅ server.js — add a simple login endpoint
-app.post("/staff/login", (req, res) => {
-  const { username, password } = req.body;
-  const USERS = [
-  { username: 'admin',    password: 'snack2024',   role: 'admin',   name: 'Admin' },
-  { username: 'waiter1',  password: 'waiter123',   role: 'waiter',  name: 'Ahmad' },
-  { username: 'waiter2',  password: 'waiter456',   role: 'waiter',  name: 'Sara' },
-  { username: 'kitchen',  password: 'kitchen123',  role: 'kitchen', name: 'Kitchen Team' },];
-
-  const found = USERS.find(u => u.username === username && u.password === password);
-  if (!found) return res.status(401).json({ error: "Invalid credentials" });
-  res.json({ role: found.role, name: found.name });
-});
-/* ================================================================
-   HELPERS
-   ================================================================ */
-function parseJsonSafe(str) {
-  if (!str) return null;
-  try { return JSON.parse(str); } catch { return str; }
-}
+  }),
+);
 
 /* ================================================================
-   CHAT  —  Gemma 3 (27B) via Gemini API
+   STAFF LOGIN
    ================================================================ */
+app.post(
+  "/staff/login",
+  authLimiter,
+  validateRequest(staffLoginValidators),
+  asyncHandler(async (req, res) => {
+    if (!process.env.JWT_SECRET) {
+      return res.status(503).json({ error: "Authentication unavailable until JWT_SECRET is configured." });
+    }
 
-const GEMINI_MODEL = 'gemma-3-27b-it';
+    const { username, password } = req.body;
+    const user = findStaffUser(username);
+
+    if (!verifyPassword(user, password)) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const token = signToken({ username: user.username, role: user.role, name: user.name });
+    res.json({ token, role: user.role, name: user.name });
+  }),
+);
+
+/* ================================================================
+   AI CHAT — Gemini 2.5 Flash via Google Generative Language API
+   Handles: custom burger orders, menu questions, staff escalation
+   ================================================================ */
+const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
 const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-/**
- * Detect language from customer message.
- * Returns: 'arabic' | 'franco' | 'english'
- */
-function detectLanguage(text) {
-  // Arabic Unicode block
-  if (/[\u0600-\u06FF]/.test(text)) return 'arabic';
-
-  // Franco Lebanese: digits used as sounds (3=ع, 2=أ, 7=ح, 5=خ, 8=غ)
-  // or common Lebanese Franco vocabulary
-  const francoNumbers = /\b\w*[32785640]\w*\b/.test(text);
-  const francoWords   = /\b(shu|yalla|kif|kifak|kifek|marhaba|ahla|ahlan|salam|3andi|3andak|baddak|bade|badi|hala2|halla2|hl2|kteer|kter|ktir|ma3|m3|la2|laa|fi|men|min|mn|3al|3l|lal|bl|bel|bil|byeji|bes|bas|shi|hek|inno|enno|yane|ya3ne|iza|lamma|kaman|kmn|3am|mshe|raye7|jaye|nhar|kel|eno|ana|inta|hiye|huwwe|howwe|mish|msh|ta2|2abel|sa7|ma7al|saret|7elo|7elwe|3anjad|tfaddal|yislam|yalla|zo2|wlek|wle|ya|habibi|habibte|ma32oul|2akid|akid|mbala|tfe|yiii|awww|heik|heidk)\b/i.test(text);
-
-  if (francoNumbers || francoWords) return 'franco';
-
-  return 'english';
-}
-
-app.post('/api/chat', async (req, res) => {
-  const { messages, menuItems } = req.body;
-
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: 'messages array required' });
+app.post("/api/chat", async (req, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({ error: "AI chat unavailable until GEMINI_API_KEY is configured." });
   }
 
-  // ── Fetch available extras from DB ────────────────────────────
-  let extrasText = "AVAILABLE CUSTOM OPTIONS (Bread, Protein, Cheese, Veggies, Sauce):\n";
+  const { messages, menuItems } = req.body;
+
+  if (!messages || !Array.isArray(messages))
+    return res.status(400).json({ error: "messages array required" });
+
+  // Fetch available add-on extras from DB (columns: id, name, price)
+  let extrasText = "AVAILABLE ADD-ON EXTRAS:\n";
   try {
-    const [extras] = await pool.query("SELECT category, name FROM extra_options");
+    const [extras] = await pool.query("SELECT name, price FROM extra_options");
     if (extras.length > 0) {
-      extras.forEach(ext => { extrasText += `- ${ext.category}: ${ext.name}\n`; });
+      extras.forEach((ext) => { extrasText += `- ${ext.name} (+$${Number(ext.price).toFixed(2)})\n`; });
     } else {
-      extrasText += "Custom options are currently unavailable.\n";
+      extrasText += "No extras currently available.\n";
     }
   } catch (err) {
     console.error("❌ Error fetching extras:", err.message);
+    extrasText += "Extras currently unavailable.\n";
   }
 
-  // ── Build menu list ───────────────────────────────────────────
+  // Build menu list from the payload sent by the frontend
   let menuList = "AVAILABLE MENU ITEMS:\n";
   if (menuItems && menuItems.length > 0) {
-    menuItems.forEach(item => { menuList += `- ${item.name} — $${item.price}\n`; });
+    menuItems.forEach((item) => { menuList += `- ${item.name} — $${item.price}\n`; });
   } else {
     menuList += "Menu is currently unavailable.\n";
   }
 
-  // ── System prompt ─────────────────────────────────────────────
-  const DYNAMIC_SYSTEM_PROMPT = `You are "Sami", the friendly assistant at Snack Attack restaurant in Lebanon.
+  const SYSTEM_PROMPT = `You are "Sami", the friendly assistant at Snack Attack restaurant in Lebanon.
 
 ════════════════════════════════════════
 LANGUAGE RULE — HIGHEST PRIORITY
@@ -396,10 +582,8 @@ STEP 2 — CONFIRMATION (MANDATORY before any action):
      - Drink: Pepsi
      Does that look right?"
 
-STEP 3 — SEND ACTION + PROFESSIONAL SUMMARY (only after customer confirms):
-  Append the CUSTOM_ORDER action, then immediately send a professional order summary.
-
-  The summary must look like this (adapt language accordingly):
+STEP 3 — SEND ACTION + SUMMARY (only after customer confirms):
+  Append the CUSTOM_ORDER action, then show the receipt summary.
 
   Franco example:
     "Perfect! Talab l order. Hayda moukhtasar talab-ak:
@@ -408,7 +592,7 @@ STEP 3 — SEND ACTION + PROFESSIONAL SUMMARY (only after customer confirms):
      │  SNACK ATTACK — TABLE [X]   │
      ├─────────────────────────────┤
      │  Custom Burger              │
-     │  • Bread : Brioche Bun      │
+     │  • Bread  : Brioche Bun     │
      │  • Protein: Beef Patty      │
      │  • Cheese : Cheddar         │
      │  • Veggies: Lettuce, Tomato │
@@ -426,7 +610,7 @@ STEP 3 — SEND ACTION + PROFESSIONAL SUMMARY (only after customer confirms):
      │  SNACK ATTACK — TABLE [X]   │
      ├─────────────────────────────┤
      │  Custom Burger              │
-     │  • Bread : Brioche Bun      │
+     │  • Bread  : Brioche Bun     │
      │  • Protein: Beef Patty      │
      │  • Cheese : Cheddar         │
      │  • Veggies: Lettuce, Tomato │
@@ -463,163 +647,194 @@ IMPORTANT RULES:
 5. SANDWICH = BURGER. Same thing. Never say you don't have sandwiches.
 6. No emojis. Keep replies short and clear.
 
-═══════════════════
-ACTIONS (silent — append at end of message, never explain to customer)
-═══════════════════
+═══════════════════════════════════════
+ACTIONS — append silently at end of message, never explain to customer
+═══════════════════════════════════════
 
 Add a regular menu item to cart:
   CART_ADD:Exact Item Name
 
-Place a confirmed custom order:
+Place a confirmed custom burger order:
   CUSTOM_ORDER:{"bread":"...","protein":"...","cheese":"...","veggies":"...","sauce":"...","notes":""}
 
-Call staff:
+Escalate to staff:
   NEED_ADMIN:reason
   (reasons: confused / complaint / request / offensive)`;
 
   try {
-    // Map messages to Gemini format
+    // Map frontend message format to Gemini format
     const mapped = messages.map((m) => ({
-      role:  m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content || ' ' }],
+      role:  m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content || " " }],
     }));
 
-    // Merge consecutive same-role turns (Gemma API requirement)
+    // Gemini requires alternating turns — merge consecutive same-role messages
     const contents = [];
     for (const msg of mapped) {
       const last = contents[contents.length - 1];
       if (last && last.role === msg.role) {
-        last.parts[0].text += '\n' + msg.parts[0].text;
+        last.parts[0].text += "\n" + msg.parts[0].text;
       } else {
         contents.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
       }
     }
 
     // Conversation must start with a user turn
-    while (contents.length > 0 && contents[0].role !== 'user') contents.shift();
+    while (contents.length > 0 && contents[0].role !== "user") contents.shift();
 
-    if (contents.length === 0) {
-      return res.status(400).json({ error: 'Conversation empty after cleaning' });
-    }
+    if (contents.length === 0)
+      return res.status(400).json({ error: "Conversation empty after cleaning" });
 
-    // Inject language tag into every user turn
+    // Inject language tag into every user turn so the model always knows which language to use
     contents.forEach((msg) => {
-      if (msg.role === 'user') {
+      if (msg.role === "user") {
         const lang = detectLanguage(msg.parts[0].text);
-        const tag  = lang === 'arabic'
-          ? '[LANGUAGE:ARABIC] — Reply in Arabic letters ONLY.\n'
-          : lang === 'franco'
-          ? '[LANGUAGE:FRANCO] — Reply in Franco Lebanese ONLY.\n'
-          : '[LANGUAGE:ENGLISH] — Reply in pure English ONLY.\n';
+        const tag  = lang === "arabic"
+          ? "[LANGUAGE:ARABIC] — Reply in Arabic letters ONLY.\n"
+          : lang === "franco"
+          ? "[LANGUAGE:FRANCO] — Reply in Franco Lebanese ONLY.\n"
+          : "[LANGUAGE:ENGLISH] — Reply in pure English ONLY.\n";
 
         msg.parts[0].text = tag + msg.parts[0].text;
         console.log(`🌐 Language: ${lang.toUpperCase()} — "${msg.parts[0].text.slice(0, 60)}..."`);
       }
     });
 
-    // Inject system prompt into the first user message
-    const firstText = contents[0].parts[0].text.replace(/\[LANGUAGE:.*?\].*?\n/, '');
-    const langTag   = contents[0].parts[0].text.match(/\[LANGUAGE:.*?\].*?\n/)?.[0] || '';
-    contents[0].parts[0].text =
-      "SYSTEM INSTRUCTIONS:\n" + DYNAMIC_SYSTEM_PROMPT +
-      "\n\n---\n" + langTag +
-      "CUSTOMER MESSAGE: " + firstText;
-
-    const body = {
-      contents,
-      generationConfig: {
-        temperature: 0.5,
-        maxOutputTokens: 500, // bumped slightly for summary
-      },
-    };
-
     const response = await fetch(GEMINI_URL, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents,
+        systemInstruction: {
+          parts: [{ text: SYSTEM_PROMPT }],
+        },
+        generationConfig: {
+          temperature:     0.5,
+          maxOutputTokens: 500,
+        },
+      }),
     });
 
     const data = await response.json();
 
-    if (!response.ok) {
-      console.error('❌ Gemini API Error:', JSON.stringify(data, null, 2));
-      return res.status(500).json({ error: 'Gemini API error', details: data?.error?.message || data });
-    }
+   if (!response.ok) {
+  console.error("❌ Gemini API Error:", JSON.stringify(data, null, 2));
+  console.error("❌ Status:", response.status);
+  console.error("❌ Model used:", GEMINI_MODEL);
+  return res.status(500).json({ 
+    error: "Gemini API error", 
+    details: data?.error?.message || data 
+  });
+}
 
     const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!reply) return res.status(500).json({ error: 'Empty response from Gemini' });
+    if (!reply) return res.status(500).json({ error: "Empty response from Gemini" });
 
+    console.log(`✅ Gemini replied: "${reply.slice(0, 80)}..."`);
     res.json({ reply });
 
   } catch (err) {
-    console.error('❌ /api/chat crash:', err.message);
+    console.error("❌ /api/chat crash:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 /* ================================================================
-   SOCKET.IO — Presence tracking per order room
+   SOCKET.IO — Real-time presence tracking per order room
    ================================================================ */
-const presence = {}; // { orderId: Set<socketId> }
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next();
+
+  try {
+    socket.user = jwt.verify(token, process.env.JWT_SECRET || "");
+    return next();
+  } catch (err) {
+    return next(new Error("Unauthorized socket connection"));
+  }
+});
 
 io.on("connection", (socket) => {
+
   socket.on("chatMessage", ({ tableId, message }) => {
-    io.emit(`chat:${tableId}`, message); // broadcast to everyone watching that table
+    if (!tableId || typeof message !== "string") return;
+    const room = getRoomName("table", tableId);
+    const sanitizedMessage = sanitizeText(message);
+    io.to(room).emit("chatMessage", {
+      message: sanitizedMessage,
+      sender: socket.user?.name || "Guest",
+      timestamp: new Date().toISOString(),
+    });
   });
 
   socket.on("joinOrder", (orderId) => {
-    socket.join(orderId);
-    if (!presence[orderId]) presence[orderId] = new Set();
-    presence[orderId].add(socket.id);
-    io.to(orderId).emit("presenceUpdate", { count: presence[orderId].size });
+    const room = getRoomName("order", orderId);
+    socket.join(room);
+    if (!presence[room]) presence[room] = new Set();
+    presence[room].add(socket.id);
+    io.to(room).emit("presenceUpdate", { count: presence[room].size });
   });
 
   socket.on("disconnect", () => {
-    for (const [orderId, set] of Object.entries(presence)) {
+    for (const [room, set] of Object.entries(presence)) {
       if (set.has(socket.id)) {
         set.delete(socket.id);
-        if (set.size === 0) delete presence[orderId];
-        else io.to(orderId).emit("presenceUpdate", { count: set.size });
+        if (set.size === 0) {
+          delete presence[room];
+        } else {
+          io.to(room).emit("presenceUpdate", { count: set.size });
+        }
       }
     }
   });
 });
 
-app.post("/create-payment-intent", async (req, res) => {
-  try {
-    const { amount, orderId } = req.body;
-
-    if (!amount || amount <= 0) {
-      return res.status(400).json({
-        error: "Invalid amount",
-      });
+/* ================================================================
+   STRIPE — Create Payment Intent
+   ================================================================ */
+app.post(
+  "/create-payment-intent",
+  validateRequest(paymentIntentValidators),
+  asyncHandler(async (req, res) => {
+    if (!process.env.STRIPE_SECRET_KEY) {
+      return res.status(503).json({ error: "Payment processing unavailable until STRIPE_SECRET_KEY is configured." });
     }
 
-    const paymentIntent =
-      await stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
-        currency: "usd",
+    const { amount, orderId } = req.body;
+    if (!orderId) {
+      return res.status(400).json({ error: "orderId is required" });
+    }
 
-        metadata: {
-          orderId: orderId?.toString() || "",
-        },
+    const [orderRows] = await pool.query("SELECT total_price FROM orders WHERE id = ?", [orderId]);
+    if (!orderRows.length) {
+      return res.status(404).json({ error: "Order not found" });
+    }
 
-        automatic_payment_methods: {
-          enabled: true,
-        },
-      });
+    const expectedAmount = Number(orderRows[0].total_price);
+    if (Math.abs(expectedAmount - Number(amount)) > 0.5) {
+      return res.status(400).json({ error: "Amount mismatch" });
+    }
 
-    res.json({
-      clientSecret: paymentIntent.client_secret,
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(expectedAmount * 100),
+      currency: "usd",
+      metadata: { orderId: orderId.toString() },
+      automatic_payment_methods: { enabled: true },
     });
-  } catch (err) {
-    console.error(err);
 
-    res.status(500).json({
-      error: err.message,
-    });
+    res.json({ clientSecret: paymentIntent.client_secret });
+  }),
+);
+
+/* ================================================================
+   START SERVER
+   ================================================================ */
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT} [${getEnvName()}]`);
+  const dbOk = await verifyDatabaseConnection();
+  if (!dbOk) {
+    console.warn("⚠️ Backend is running, but database access is not available. Some routes may fail until DB configuration is fixed.");
   }
 });
-
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
