@@ -495,17 +495,19 @@ app.post(
    Handles: custom burger orders, menu questions, staff escalation
    ================================================================ */
 const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
-const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
 app.post("/api/chat", async (req, res) => {
   if (!process.env.GEMINI_API_KEY) {
+    console.warn("⚠️ /api/chat requested but GEMINI_API_KEY is not configured.");
     return res.status(503).json({ error: "AI chat unavailable until GEMINI_API_KEY is configured." });
   }
 
   const { messages, menuItems } = req.body;
 
-  if (!messages || !Array.isArray(messages))
+  if (!messages || !Array.isArray(messages)) {
+    console.warn("⚠️ /api/chat received invalid messages:", typeof messages);
     return res.status(400).json({ error: "messages array required" });
+  }
 
   // Fetch available add-on extras from DB (columns: id, name, price)
   let extrasText = "AVAILABLE ADD-ON EXTRAS:\n";
@@ -700,42 +702,66 @@ Escalate to staff:
       }
     });
 
-    const response = await fetch(GEMINI_URL, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents,
-        systemInstruction: {
-          parts: [{ text: SYSTEM_PROMPT }],
-        },
-        generationConfig: {
-          temperature:     0.5,
-          maxOutputTokens: 500,
-        },
-      }),
-    });
+    const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
 
-    const data = await response.json();
+    console.log(`📡 Calling Gemini API (${GEMINI_MODEL}) with ${contents.length} conversation turns...`);
 
-   if (!response.ok) {
-  console.error("❌ Gemini API Error:", JSON.stringify(data, null, 2));
-  console.error("❌ Status:", response.status);
-  console.error("❌ Model used:", GEMINI_MODEL);
-  return res.status(500).json({ 
-    error: "Gemini API error", 
-    details: data?.error?.message || data 
-  });
-}
+    let response;
+    try {
+      response = await fetch(GEMINI_URL, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents,
+          systemInstruction: {
+            parts: [{ text: SYSTEM_PROMPT }],
+          },
+          generationConfig: {
+            temperature:     0.5,
+            maxOutputTokens: 500,
+          },
+        }),
+      });
+    } catch (fetchErr) {
+      console.error("❌ Gemini fetch failed:", fetchErr.message);
+      return res.status(503).json({ error: "Failed to reach Gemini API. Please try again." });
+    }
+
+    let data;
+    try {
+      data = await response.json();
+    } catch (parseErr) {
+      console.error("❌ Gemini response parse error:", parseErr.message);
+      console.error("❌ Response status:", response.status);
+      return res.status(502).json({ error: "Invalid response from Gemini API." });
+    }
+
+    if (!response.ok) {
+      const errorMsg = data?.error?.message || JSON.stringify(data);
+      console.error(`❌ Gemini API returned ${response.status}:`, errorMsg);
+      console.error("❌ Full error response:", JSON.stringify(data, null, 2));
+      
+      if (response.status === 401 || response.status === 403) {
+        return res.status(503).json({ error: "Gemini API authentication failed. Check GEMINI_API_KEY." });
+      }
+      if (response.status === 429) {
+        return res.status(429).json({ error: "Gemini API rate limit exceeded. Please try again soon." });
+      }
+      
+      return res.status(502).json({ error: "Gemini API error. Please try again." });
+    }
 
     const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!reply) return res.status(500).json({ error: "Empty response from Gemini" });
+    if (!reply) {
+      console.error("❌ Gemini returned empty reply. Response:", JSON.stringify(data, null, 2));
+      return res.status(502).json({ error: "Gemini API returned empty response." });
+    }
 
-    console.log(`✅ Gemini replied: "${reply.slice(0, 80)}..."`);
+    console.log(`✅ Gemini replied: "${reply.slice(0, 100)}..."`);
     res.json({ reply });
-
   } catch (err) {
-    console.error("❌ /api/chat crash:", err.message);
-    res.status(500).json({ error: err.message });
+    console.error("❌ /api/chat route error:", err.message, err.stack);
+    res.status(500).json({ error: "Internal server error. Please try again." });
   }
 });
 
