@@ -502,6 +502,12 @@ app.post("/api/chat", async (req, res) => {
     return res.status(503).json({ error: "AI chat unavailable until GEMINI_API_KEY is configured." });
   }
 
+  // Validate GEMINI_API_KEY format (should be alphanumeric-only, not a model name)
+  if (process.env.GEMINI_API_KEY.includes("/") || process.env.GEMINI_API_KEY.includes("-") && process.env.GEMINI_API_KEY.includes("it")) {
+    console.error("❌ GEMINI_API_KEY appears to be misconfigured (looks like a model name, not an API key)");
+    return res.status(503).json({ error: "GEMINI_API_KEY is misconfigured. Please use a valid Google Gemini API key." });
+  }
+
   const { messages, menuItems } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
