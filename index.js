@@ -53,7 +53,7 @@ const corsOptions = {
   credentials: true,
 };
 
-app.use(helmet());
+
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
@@ -191,6 +191,10 @@ async function validateOrderItems(conn, items, totalPrice) {
       throw new Error("Each item quantity must be at least 1.");
     }
 
+    const extrasTotal = Array.isArray(item.selectedExtras)
+      ? item.selectedExtras.reduce((s, e) => s + Number(e.price || 0), 0)
+      : 0;
+
     const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
     const removedExtras = item.removedExtras ? JSON.stringify(item.removedExtras) : null;
     const specialNote = item.specialNote ? sanitizeText(item.specialNote) : null;
@@ -200,7 +204,7 @@ async function validateOrderItems(conn, items, totalPrice) {
       if (isNaN(price) || price <= 0) {
         throw new Error(`Custom item "${item.name || "custom item"}" requires a valid price.`);
       }
-      computedTotal += price * quantity;
+      computedTotal += (price + extrasTotal) * quantity;
       validatedItems.push({
         itemId: null,
         name: item.name || "Custom Burger",
@@ -228,7 +232,7 @@ async function validateOrderItems(conn, items, totalPrice) {
       throw new Error(`Menu item "${menuItem.name || item.name || itemId}" has an invalid price.`);
     }
 
-    computedTotal += price * quantity;
+    computedTotal += (price + extrasTotal) * quantity;
     validatedItems.push({
       itemId,
       name: menuItem.name || item.name,
@@ -240,8 +244,9 @@ async function validateOrderItems(conn, items, totalPrice) {
     });
   }
 
-  if (Math.abs(Number(totalPrice) - computedTotal) > 0.5) {
-    throw new Error("Total price mismatch. The order total must match item prices.");
+  const preTaxTotal = Number(totalPrice) / 1.11;
+  if (Math.abs(preTaxTotal - computedTotal) > 0.5) {
+    throw new Error("Total price mismatch...");
   }
 
   return validatedItems;
