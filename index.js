@@ -4,7 +4,7 @@ const http = require("http");
 const path = require("path");
 const cors = require("cors");
 const helmet = require("helmet");
-const xssClean = require("xss-clean");
+
 const rateLimit = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
@@ -55,7 +55,7 @@ const corsOptions = {
 
 app.use(helmet());
 app.use(cors(corsOptions));
-app.use(xssClean());
+
 app.use(express.json({ limit: "10kb" }));
 app.use("/images", express.static(path.join(__dirname, "images"), { maxAge: "7d", index: false }));
 
