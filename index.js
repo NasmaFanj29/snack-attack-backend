@@ -151,7 +151,9 @@ const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
     methods: ["GET", "POST"],
+    credentials: true,
   },
+  transports: ["websocket", "polling"], // لازم
 });
 
 const presence = {}; // { room: Set<socketId> }
@@ -251,7 +253,9 @@ async function validateOrderItems(conn, items, totalPrice) {
 
   return validatedItems;
 }
-
+app.get("/", (req, res) => {
+  res.send("Snack Attack API is running 🚀");
+});
 /* ================================================================
    PLACE ORDER
    ================================================================ */
@@ -259,7 +263,7 @@ app.post(
   "/place-order",
   validateRequest(placeOrderValidators),
   asyncHandler(async (req, res) => {
-    const { customer = {}, table_id, total_price, items, payment_splits } = req.body;
+    const { customer = {}, table_id, total_price, items, payment_splits, tip_amount } = req.body;
     const customerName = sanitizeText(customer.name?.trim() || "Guest");
     const phoneNumber = customer.phone?.trim() || null;
 
@@ -285,8 +289,8 @@ app.post(
       const validatedItems = await validateOrderItems(conn, items, total_price);
 
       const [orderResult] = await conn.query(
-        "INSERT INTO orders (table_id, total_price, status, user_id, payment_splits) VALUES (?, ?, 'Requested', ?, ?)",
-        [table_id || 1, Number(total_price), userId, JSON.stringify(payment_splits || [])],
+       "INSERT INTO orders (table_id, total_price, status, user_id, payment_splits, tip_amount) VALUES (?, ?, 'Requested', ?, ?, ?)",
+        [table_id || 1, Number(total_price), userId, JSON.stringify(payment_splits || []), Number(tip_amount || 0)],
       );
       const orderId = orderResult.insertId;
 
@@ -320,7 +324,43 @@ app.post(
     }
   }),
 );
+/* ── CUSTOMER: Confirm payment (public) ── */
+/* ================================================================
+   CONFIRM PAYMENT (Customer)
+   ================================================================ */
+app.put("/orders/:id/confirm-payment", asyncHandler(async (req, res) => {
+  const { payment_splits, tip_amount } = req.body;
 
+  const updates = ["status = ?"];
+  const values  = ["PaymentPending"];
+
+  if (payment_splits !== undefined) {
+    updates.push("payment_splits = ?");
+    values.push(JSON.stringify(payment_splits));
+  }
+  if (tip_amount !== undefined) {
+    updates.push("tip_amount = ?");
+    values.push(Number(tip_amount) || 0);
+  }
+
+  values.push(req.params.id);
+
+  await pool.query(
+    `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
+    values
+  );
+
+  const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
+  const [items] = await pool.query(
+    `SELECT oi.*, m.name
+     FROM order_items oi
+     LEFT JOIN menuitems m ON oi.item_id = m.id
+     WHERE oi.order_id = ?`,
+    [req.params.id]
+  );
+
+  res.json({ success: true, order: order[0], items });
+}));
 /* ================================================================
    ADMIN — GET ALL ORDERS
    ================================================================ */
@@ -378,15 +418,17 @@ app.get("/admin/orders", authenticateJWT, requireRole("admin", "waiter", "kitche
    ================================================================ */
 app.put("/admin/orders/:id/status", authenticateJWT, requireRole("admin", "waiter", "kitchen"), async (req, res) => {
   try {
-    const { status, payment_splits, replace_splits, reason } = req.body;
-    const updates = [];
-    const values  = [];
+  
+      const { status, payment_splits, replace_splits, reason, tip_amount } = req.body;
+      const updates = [];
+      const values  = [];
 
-    if (status)                          { updates.push("status = ?");          values.push(status); }
-    if (payment_splits && replace_splits){ updates.push("payment_splits = ?");   values.push(JSON.stringify(payment_splits)); }
-    if (reason)                          { updates.push("rejection_reason = ?"); values.push(reason); }
-
-    if (updates.length === 0) return res.json({ success: true });
+      if (status)                          { updates.push("status = ?");          values.push(status); }
+      if (payment_splits && replace_splits){ updates.push("payment_splits = ?");   values.push(JSON.stringify(payment_splits)); }
+      if (reason)                          { updates.push("rejection_reason = ?"); values.push(reason); }
+      if (tip_amount !== undefined)        { updates.push("tip_amount = ?");       values.push(Number(tip_amount) || 0); }
+          
+if (updates.length === 0) return res.json({ success: true });
 
     values.push(req.params.id);
     await pool.query(`UPDATE orders SET ${updates.join(", ")} WHERE id = ?`, values);
@@ -487,8 +529,10 @@ app.post(
     }
 
     const { username, password } = req.body;
+    console.log("LOGIN ATTEMPT:", username);
     const user = findStaffUser(username);
-
+    console.log("FOUND USER:", user);
+    
     if (!verifyPassword(user, password)) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
