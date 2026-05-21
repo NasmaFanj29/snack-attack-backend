@@ -58,7 +58,51 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
 app.use(cors(corsOptions));
+app.post(
+  "/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
 
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature failed:", err.message);
+      return res.sendStatus(400);
+    }
+
+    // FIX (Issue 4): Idempotency — ignore events we've already processed
+    if (webhookEventCache.has(event.id)) {
+      console.log(`Webhook event ${event.id} already processed, skipping.`);
+      return res.json({ received: true });
+    }
+    webhookEventCache.add(event.id);
+
+    if (event.type === "payment_intent.succeeded") {
+      const paymentIntent = event.data.object;
+      const orderId = paymentIntent.metadata.orderId;
+
+      if (!orderId) {
+        console.error("Webhook: payment_intent.succeeded missing orderId in metadata");
+        return res.json({ received: true });
+      }
+
+      await pool.query(
+        "UPDATE orders SET status = 'Paid' WHERE id = ?",
+        [orderId]
+      );
+      console.log(`✅ Order ${orderId} marked as Paid via webhook`);
+    }
+
+    res.json({ received: true });
+  }
+);
 app.use(express.json({ limit: "10kb" }));
 app.use("/images", express.static(path.join(__dirname, "images"), { maxAge: "7d", index: false }));
 
@@ -87,7 +131,9 @@ const chatLimiter = rateLimit({
   message: { error: "Too many chat requests. Slow down a bit." },
 });
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2023-08-16" });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2025-04-30" });
+
+// FIX (Issue 4): Cache is now wired into the webhook handler above
 const webhookEventCache = new Set();
 
 const dbName = pool.dbName;
@@ -117,6 +163,8 @@ function reportStartupIssues() {
   if (!process.env.DB_PASSWORD) issues.push("DB_PASSWORD");
   if (!process.env.DB_DATABASE && !process.env.DB_NAME) issues.push("DB_DATABASE or DB_NAME");
   if (!process.env.JWT_SECRET) issues.push("JWT_SECRET");
+  // FIX (Issue 5): Webhook will silently reject every Stripe event without this
+  if (!process.env.STRIPE_WEBHOOK_SECRET) issues.push("STRIPE_WEBHOOK_SECRET");
 
   if (issues.length) {
     console.warn(`WARNING: Backend is starting with missing configuration: ${issues.join(", ")}.`);
@@ -256,6 +304,8 @@ async function validateOrderItems(conn, items, totalPrice) {
 app.get("/", (req, res) => {
   res.send("Snack Attack API is running 🚀");
 });
+
+
 /* ================================================================
    PLACE ORDER
    ================================================================ */
@@ -328,39 +378,42 @@ app.post(
 /* ================================================================
    CONFIRM PAYMENT (Customer)
    ================================================================ */
-app.put("/orders/:id/confirm-payment", asyncHandler(async (req, res) => {
-  const { payment_splits, tip_amount } = req.body;
+app.put("/orders/:id/confirm-payment", async (req, res) => {
+  try {
+    const { payment_splits, tip_amount } = req.body;
 
-  const updates = ["status = ?"];
-  const values  = ["PaymentPending"];
+    const updates = ["status = ?"];
+    const values  = ["PaymentPending"];
 
-  if (payment_splits !== undefined) {
-    updates.push("payment_splits = ?");
-    values.push(JSON.stringify(payment_splits));
+    if (payment_splits !== undefined) {
+      updates.push("payment_splits = ?");
+      values.push(JSON.stringify(payment_splits));
+    }
+    if (tip_amount !== undefined) {
+      updates.push("tip_amount = ?");
+      values.push(Number(tip_amount) || 0);
+    }
+
+    values.push(req.params.id);
+
+    await pool.query(
+      `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
+      values
+    );
+
+    const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
+    const [items] = await pool.query(
+      `SELECT oi.*, m.name FROM order_items oi
+       LEFT JOIN menuitems m ON oi.item_id = m.id
+       WHERE oi.order_id = ?`,
+      [req.params.id]
+    );
+
+    res.json({ success: true, order: order[0], items });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  if (tip_amount !== undefined) {
-    updates.push("tip_amount = ?");
-    values.push(Number(tip_amount) || 0);
-  }
-
-  values.push(req.params.id);
-
-  await pool.query(
-    `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
-    values
-  );
-
-  const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
-  const [items] = await pool.query(
-    `SELECT oi.*, m.name
-     FROM order_items oi
-     LEFT JOIN menuitems m ON oi.item_id = m.id
-     WHERE oi.order_id = ?`,
-    [req.params.id]
-  );
-
-  res.json({ success: true, order: order[0], items });
-}));
+});
 /* ================================================================
    ADMIN — GET ALL ORDERS
    ================================================================ */
@@ -514,6 +567,42 @@ app.get(
 
     res.json({ order: order[0], items: parsedItems });
   }),
+);
+
+/* ================================================================
+   CUSTOMER — Update payment splits (public, no auth required)
+   FIX: Checkout.js was calling /admin/orders/:id/status (auth-required)
+   to sync payer data. Customers have no JWT token → 401 on every keystroke.
+   This endpoint lets the customer page sync payment_splits and tip_amount
+   without changing the order status.
+   ================================================================ */
+app.put(
+  "/orders/:id/splits",
+  asyncHandler(async (req, res) => {
+    const orderId = req.params.id;
+    const { payment_splits, tip_amount } = req.body;
+
+    const updates = [];
+    const values  = [];
+
+    if (payment_splits !== undefined) {
+      updates.push("payment_splits = ?");
+      values.push(JSON.stringify(payment_splits));
+    }
+    if (tip_amount !== undefined) {
+      updates.push("tip_amount = ?");
+      values.push(Number(tip_amount) || 0);
+    }
+
+    if (updates.length === 0) return res.json({ success: true });
+
+    values.push(orderId);
+    await pool.query(
+      `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
+      values
+    );
+    res.json({ success: true });
+  })
 );
 
 /* ================================================================
@@ -881,36 +970,72 @@ io.on("connection", (socket) => {
    ================================================================ */
 app.post(
   "/create-payment-intent",
-  validateRequest(paymentIntentValidators),
   asyncHandler(async (req, res) => {
     if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(503).json({ error: "Payment processing unavailable until STRIPE_SECRET_KEY is configured." });
+      return res.status(503).json({ error: "Stripe unavailable" });
     }
 
-    const { amount, orderId } = req.body;
+    const { orderId } = req.body;
+
     if (!orderId) {
-      return res.status(400).json({ error: "orderId is required" });
+      return res.status(400).json({
+        error: "orderId is required",
+      });
     }
 
-    const [orderRows] = await pool.query("SELECT total_price FROM orders WHERE id = ?", [orderId]);
+    const [orderRows] = await pool.query(
+      "SELECT id, total_price, status FROM orders WHERE id = ?",
+      [orderId]
+    );
+
     if (!orderRows.length) {
-      return res.status(404).json({ error: "Order not found" });
+      return res.status(404).json({
+        error: "Order not found",
+      });
     }
 
-    const expectedAmount = Number(orderRows[0].total_price);
-    if (Math.abs(expectedAmount - Number(amount)) > 0.5) {
-      return res.status(400).json({ error: "Amount mismatch" });
+    const order = orderRows[0];
+
+    // Prevent duplicate payment
+    if (order.status === "Paid") {
+      return res.status(400).json({
+        error: "Order already paid",
+      });
     }
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(expectedAmount * 100),
-      currency: "usd",
-      metadata: { orderId: orderId.toString() },
-      automatic_payment_methods: { enabled: true },
+    const total = Number(order.total_price);
+
+    if (isNaN(total) || total <= 0) {
+      return res.status(400).json({
+        error: "Invalid order total",
+      });
+    }
+
+    const amountInCents = Math.round(total * 100);
+
+    // FIX (Issue 7): Idempotency key prevents duplicate charges on retries/double-taps
+    // FIX (Issue 12): payment_method_types: ["card"] matches the CardElement UI;
+    //                 automatic_payment_methods was for PaymentElement and offered
+    //                 wallets/bank-debits that the frontend couldn't collect.
+    const paymentIntent = await stripe.paymentIntents.create(
+      {
+        amount: amountInCents,
+        currency: "usd",
+        payment_method_types: ["card"],
+        metadata: {
+          orderId: String(order.id),
+        },
+      },
+      {
+        idempotencyKey: `order_${orderId}`,
+      }
+    );
+
+    res.json({
+      success: true,
+      clientSecret: paymentIntent.client_secret,
     });
-
-    res.json({ clientSecret: paymentIntent.client_secret });
-  }),
+  })
 );
 
 /* ================================================================
