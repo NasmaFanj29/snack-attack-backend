@@ -131,7 +131,7 @@ const chatLimiter = rateLimit({
   message: { error: "Too many chat requests. Slow down a bit." },
 });
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2025-04-30" });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2023-08-16"  });
 
 // FIX (Issue 4): Cache is now wired into the webhook handler above
 const webhookEventCache = new Set();
