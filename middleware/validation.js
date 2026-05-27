@@ -14,21 +14,13 @@ function validateRequest(validations) {
 }
 
 const placeOrderValidators = [
-  body("customer").optional().isObject(),
-  body("customer.name").optional().isString().trim().isLength({ min: 1, max: 100 }),
-  body("customer.phone").optional().isString().trim().isLength({ min: 6, max: 25 }),
-  body("table_id").optional().isInt({ min: 1 }),
-  body("total_price").exists().isFloat({ gt: 0 }),
+  body("tableId").exists().isInt({ min: 1 }),
+  body("totalPrice").exists().isFloat({ gt: 0 }),
   body("items").isArray({ min: 1 }),
   body("items.*.name").exists().isString().trim().isLength({ min: 1 }),
   body("items.*.quantity").optional().isInt({ min: 1 }),
-  body("items.*.price").optional().isFloat({ gt: 0 }),
-  body("items.*.databaseId").optional().isInt({ min: 1 }),
-  body("items.*.item_id").optional().isInt({ min: 1 }),
-  body("items.*.menu_id").optional().isInt({ min: 1 }),
-  body("items.*.id").optional().isInt({ min: 1 }),
-  body("items.*.isCustom").optional().isBoolean(),
-  body("payment_splits").optional().isArray(),
+  body("items.*.price").optional().isFloat({ min: 0 }),
+  body("specialNotes").optional({ nullable: true }).isString(),
 ];
 
 const staffLoginValidators = [
@@ -37,8 +29,10 @@ const staffLoginValidators = [
 ];
 
 const paymentIntentValidators = [
-  body("amount").exists().isFloat({ gt: 0 }),
-  body("orderId").optional().isInt({ min: 1 }),
+  body("orderId")
+    .exists()
+    .customSanitizer(v => Number(v))
+    .isInt({ min: 1 }),
 ];
 
 const chatValidators = [

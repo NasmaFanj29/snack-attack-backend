@@ -4,6 +4,7 @@ const http = require("http");
 const path = require("path");
 const cors = require("cors");
 const helmet = require("helmet");
+const { v4: uuidv4 } = require("uuid");
 
 const rateLimit = require("express-rate-limit");
 const jwt = require("jsonwebtoken");
@@ -103,12 +104,12 @@ app.post(
     res.json({ received: true });
   }
 );
-app.use(express.json({ limit: "10kb" }));
+app.use(express.json({ limit: "100kb" }));
 app.use("/images", express.static(path.join(__dirname, "images"), { maxAge: "7d", index: false }));
 
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: process.env.NODE_ENV === 'production' ? 200 : 2000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests from this IP, please try again later." },
@@ -125,16 +126,31 @@ const authLimiter = rateLimit({
 
 const chatLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 15,
+  max: 10, // ← من 15 لـ 10
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many chat requests. Slow down a bit." },
 });
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2023-08-16"  });
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2023-08-16" });
 
 // FIX (Issue 4): Cache is now wired into the webhook handler above
 const webhookEventCache = new Set();
+const GEMINI_KEYS = [
+  process.env.GEMINI_API_KEY_1,
+  process.env.GEMINI_API_KEY_2,
+  process.env.GEMINI_API_KEY_3,
+  process.env.GEMINI_API_KEY_4,
+  process.env.GEMINI_API_KEY_5,
+  process.env.GEMINI_API_KEY_6,
+  process.env.GEMINI_API_KEY_7,
+  process.env.GEMINI_API_KEY_8,
+].filter(Boolean);
+
+let geminiKeyIndex = 0;
+const getGeminiKey = (offset = 0) => {
+  return GEMINI_KEYS[(geminiKeyIndex + offset) % GEMINI_KEYS.length];
+};
 
 const dbName = pool.dbName;
 const dbHost = pool.dbHost;
@@ -145,8 +161,8 @@ const dbWarnings = pool.dbWarnings;
 if (!process.env.STRIPE_SECRET_KEY) {
   console.warn("WARNING: STRIPE_SECRET_KEY is not set. Stripe payments will not work until configured.");
 }
-if (!process.env.GEMINI_API_KEY) {
-  console.warn("WARNING: GEMINI_API_KEY is not set. AI chat will be unavailable until configured.");
+if (GEMINI_KEYS.length === 0) {
+  console.warn("WARNING: No GEMINI API keys configured. AI chat will be unavailable.");
 }
 if (process.env.NODE_ENV === "production" && !process.env.CORS_ORIGINS) {
   console.warn("WARNING: CORS_ORIGINS is not configured. Restrict origins in production.");
@@ -163,7 +179,6 @@ function reportStartupIssues() {
   if (!process.env.DB_PASSWORD) issues.push("DB_PASSWORD");
   if (!process.env.DB_DATABASE && !process.env.DB_NAME) issues.push("DB_DATABASE or DB_NAME");
   if (!process.env.JWT_SECRET) issues.push("JWT_SECRET");
-  // FIX (Issue 5): Webhook will silently reject every Stripe event without this
   if (!process.env.STRIPE_WEBHOOK_SECRET) issues.push("STRIPE_WEBHOOK_SECRET");
 
   if (issues.length) {
@@ -201,10 +216,13 @@ const io = new Server(server, {
     methods: ["GET", "POST"],
     credentials: true,
   },
-  transports: ["websocket", "polling"], // لازم
+  transports: ["websocket", "polling"],
 });
 
 const presence = {}; // { room: Set<socketId> }
+
+// ⭐ MAKE PAYMENT ROUTES ABLE TO ACCESS SOCKET.IO
+app.set('io', io);
 
 function getRoomName(type, id) {
   return `${type}:${id}`;
@@ -248,755 +266,335 @@ async function validateOrderItems(conn, items, totalPrice) {
     const selectedExtras = item.selectedExtras ? JSON.stringify(item.selectedExtras) : null;
     const removedExtras = item.removedExtras ? JSON.stringify(item.removedExtras) : null;
     const specialNote = item.specialNote ? sanitizeText(item.specialNote) : null;
+    const isCustom = Boolean(item.isCustom);
 
-    if (item.isCustom) {
-      const price = Number(item.price);
-      if (isNaN(price) || price <= 0) {
-        throw new Error(`Custom item "${item.name || "custom item"}" requires a valid price.`);
+    let itemPrice = 0;
+    if (isCustom) {
+      itemPrice = Number(item.price) || 0;
+    } else {
+      const resolvedId = resolveItemId(item);
+      if (!resolvedId || !menuItemMap[resolvedId]) {
+        throw new Error(`Menu item ${resolveItemId(item)} not found.`);
       }
-      computedTotal += (price + extrasTotal) * quantity;
-      validatedItems.push({
-        itemId: null,
-        name: item.name || "Custom Burger",
-        quantity,
-        price,
-        selectedExtras,
-        removedExtras,
-        specialNote,
-      });
-      continue;
+      itemPrice = Number(menuItemMap[resolvedId].price) || 0;
     }
 
-    const itemId = resolveItemId(item);
-    if (!itemId) {
-      throw new Error(`Missing menu item ID for item "${item.name || "unknown"}".`);
-    }
+    const lineTotal = (itemPrice + extrasTotal) * quantity;
+    computedTotal += lineTotal;
 
-    const menuItem = menuItemMap[itemId];
-    if (!menuItem) {
-      throw new Error(`Menu item ID ${itemId} not found.`);
-    }
-
-    const price = Number(menuItem.price);
-    if (isNaN(price) || price <= 0) {
-      throw new Error(`Menu item "${menuItem.name || item.name || itemId}" has an invalid price.`);
-    }
-
-    computedTotal += (price + extrasTotal) * quantity;
     validatedItems.push({
-      itemId,
-      name: menuItem.name || item.name,
+      isCustom,
+      ...(isCustom && { customName: item.name }),
+      ...(!isCustom && { menu_id: resolveItemId(item) }),
       quantity,
-      price,
+      price: itemPrice,
+      extrasTotal,
+      lineTotal,
       selectedExtras,
       removedExtras,
       specialNote,
     });
   }
+  // أضفه مؤقتاً جوا validateOrderItems قبل التحقق من الـ total
+console.log("DEBUG computedTotal:", computedTotal);
+console.log("DEBUG totalPrice received:", totalPrice);
+console.log("DEBUG with VAT:", computedTotal * 1.11);
 
-  const preTaxTotal = Number(totalPrice) / 1.11;
-  if (Math.abs(preTaxTotal - computedTotal) > 0.5) {
-    throw new Error("Total price mismatch...");
-  }
+// ✅ AFTER
+const computedWithVAT = computedTotal * 1.11;
+const totalDifference = Math.abs(computedWithVAT - totalPrice);
+if (totalDifference > 0.5) {
+  throw new Error(`Cart total mismatch. Expected ${computedWithVAT.toFixed(2)}, got ${totalPrice.toFixed(2)}.`);
+}
 
   return validatedItems;
 }
+
 app.get("/", (req, res) => {
-  res.send("Snack Attack API is running 🚀");
+  res.json({
+    message: "🍽️ Snack Attack backend is running!",
+    environment: getEnvName(),
+    endpoints: [
+      "POST /api/staff/login",
+      "GET /api/menu",
+      "GET /api/extras",
+      "POST /api/orders",
+      "GET /api/admin/orders",
+      "POST /api/chat",
+    ],
+  });
 });
 
-
-/* ================================================================
-   PLACE ORDER
-   ================================================================ */
 app.post(
-  "/place-order",
-  validateRequest(placeOrderValidators),
-  asyncHandler(async (req, res) => {
-    const { customer = {}, table_id, total_price, items, payment_splits, tip_amount } = req.body;
-    const customerName = sanitizeText(customer.name?.trim() || "Guest");
-    const phoneNumber = customer.phone?.trim() || null;
-
-    let conn;
-    try {
-      conn = await pool.getConnection();
-      await conn.beginTransaction();
-
-      let userId = null;
-      if (phoneNumber) {
-        const [userRows] = await conn.query("SELECT user_id FROM users WHERE phone_number = ?", [phoneNumber]);
-        if (userRows.length) userId = userRows[0].user_id;
-      }
-
-      if (!userId) {
-        const [userResult] = await conn.query(
-          "INSERT INTO users (full_name, phone_number, qlub_balance) VALUES (?, ?, 0)",
-          [customerName, phoneNumber],
-        );
-        userId = userResult.insertId;
-      }
-
-      const validatedItems = await validateOrderItems(conn, items, total_price);
-
-      const [orderResult] = await conn.query(
-       "INSERT INTO orders (table_id, total_price, status, user_id, payment_splits, tip_amount) VALUES (?, ?, 'Requested', ?, ?, ?)",
-        [table_id || 1, Number(total_price), userId, JSON.stringify(payment_splits || []), Number(tip_amount || 0)],
-      );
-      const orderId = orderResult.insertId;
-
-      let savedCount = 0;
-      for (const item of validatedItems) {
-        await conn.query(
-          `INSERT INTO order_items
-             (order_id, item_id, quantity, price_at_time, special_note, removed_extras, selected_extras)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            orderId,
-            item.itemId,
-            item.quantity,
-            item.price,
-            item.specialNote,
-            item.removedExtras,
-            item.selectedExtras,
-          ],
-        );
-        savedCount += 1;
-      }
-
-      await conn.commit();
-      res.json({ success: true, orderId, savedCount });
-    } catch (err) {
-      if (conn) await conn.rollback();
-      console.error("❌ Place Order Error:", err.message);
-      res.status(500).json({ error: err.message });
-    } finally {
-      if (conn) conn.release();
-    }
-  }),
-);
-/* ── CUSTOMER: Confirm payment (public) ── */
-/* ================================================================
-   CONFIRM PAYMENT (Customer)
-   ================================================================ */
-app.put("/orders/:id/confirm-payment", async (req, res) => {
-  try {
-    const { payment_splits, tip_amount } = req.body;
-
-    const updates = ["status = ?"];
-    const values  = ["PaymentPending"];
-
-    if (payment_splits !== undefined) {
-      updates.push("payment_splits = ?");
-      values.push(JSON.stringify(payment_splits));
-    }
-    if (tip_amount !== undefined) {
-      updates.push("tip_amount = ?");
-      values.push(Number(tip_amount) || 0);
-    }
-
-    values.push(req.params.id);
-
-    await pool.query(
-      `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
-      values
-    );
-
-    const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
-    const [items] = await pool.query(
-      `SELECT oi.*, m.name FROM order_items oi
-       LEFT JOIN menuitems m ON oi.item_id = m.id
-       WHERE oi.order_id = ?`,
-      [req.params.id]
-    );
-
-    res.json({ success: true, order: order[0], items });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-/* ================================================================
-   ADMIN — GET ALL ORDERS
-   ================================================================ */
-app.get("/admin/orders", authenticateJWT, requireRole("admin", "waiter", "kitchen"), async (req, res) => {
-  try {
-    const [orders] = await pool.query(`
-      SELECT o.*, u.full_name, u.phone_number
-      FROM orders o
-      LEFT JOIN users u ON o.user_id = u.user_id
-      ORDER BY o.created_at DESC
-    `);
-
-    if (orders.length === 0) return res.json([]);
-
-    const orderIds = orders.map((o) => o.id);
-
-    const [allItems] = await pool.query(`
-      SELECT oi.*, m.name
-      FROM order_items oi
-      LEFT JOIN menuitems m ON oi.item_id = m.id
-      WHERE oi.order_id IN (${orderIds.map(() => "?").join(",")})
-      ORDER BY oi.order_id, oi.id
-    `, orderIds);
-
-    // Group items by order ID
-    const itemsMap = {};
-    (allItems || []).forEach((item) => {
-      const parsed = {
-        ...item,
-        name: item.name
-          || (item.special_note?.startsWith("Custom:") ? "Custom Burger" : `Item #${item.item_id || item.id}`),
-        selected_extras: parseJsonSafe(item.selected_extras) || [],
-        removed_extras:  parseJsonSafe(item.removed_extras)  || [],
-      };
-      if (!itemsMap[item.order_id]) itemsMap[item.order_id] = [];
-      itemsMap[item.order_id].push(parsed);
-    });
-
-    const result = orders.map((order) => ({
-      ...order,
-      full_name:   order.full_name || "Guest",
-      items:       itemsMap[order.id] || [],
-      order_items: itemsMap[order.id] || [],
-    }));
-
-    res.json(result);
-  } catch (err) {
-    console.error("❌ Admin Fetch Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================================================================
-   ADMIN — UPDATE ORDER STATUS
-   ================================================================ */
-app.put("/admin/orders/:id/status", authenticateJWT, requireRole("admin", "waiter", "kitchen"), async (req, res) => {
-  try {
-  
-      const { status, payment_splits, replace_splits, reason, tip_amount } = req.body;
-      const updates = [];
-      const values  = [];
-
-      if (status)                          { updates.push("status = ?");          values.push(status); }
-      if (payment_splits && replace_splits){ updates.push("payment_splits = ?");   values.push(JSON.stringify(payment_splits)); }
-      if (reason)                          { updates.push("rejection_reason = ?"); values.push(reason); }
-      if (tip_amount !== undefined)        { updates.push("tip_amount = ?");       values.push(Number(tip_amount) || 0); }
-          
-if (updates.length === 0) return res.json({ success: true });
-
-    values.push(req.params.id);
-    await pool.query(`UPDATE orders SET ${updates.join(", ")} WHERE id = ?`, values);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Update Status Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================================================================
-   ADMIN — DELETE ORDER
-   ================================================================ */
-app.delete("/admin/orders/:id", authenticateJWT, requireRole("admin"), async (req, res) => {
-  try {
-    await pool.query("DELETE FROM order_items WHERE order_id = ?", [req.params.id]);
-    await pool.query("DELETE FROM orders WHERE id = ?",            [req.params.id]);
-    res.json({ success: true });
-  } catch (err) {
-    console.error("❌ Delete Order Error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/* ================================================================
-   MENU ITEMS
-   ================================================================ */
-app.get("/menu", async (req, res) => {
-  try {
-    const [items] = await pool.query("SELECT * FROM menuitems");
-    res.json(items);
-  } catch (err) {
-    console.error("❌ Error fetching menu:", err);
-    res.status(500).json({ error: "Failed to fetch menu items" });
-  }
-});
-
-/* ================================================================
-   EXTRAS
-   Note: extra_options table has columns (id, name, price) only.
-   Both routes return all extras — no per-item filtering needed.
-   ================================================================ */
-app.get("/extras", async (req, res) => {
-  try {
-    const [extras] = await pool.query("SELECT * FROM extra_options");
-    res.json(extras);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get(
-  "/item-extras/:id",
-  validateRequest(orderIdParamValidator),
-  asyncHandler(async (req, res) => {
-    const [extras] = await pool.query("SELECT * FROM extra_options");
-    res.json({ itemId: Number(req.params.id), extras });
-  }),
-);
-
-/* ================================================================
-   SINGLE ORDER
-   ================================================================ */
-app.get(
-  "/orders/:id",
-  validateRequest(orderIdParamValidator),
-  asyncHandler(async (req, res) => {
-    const [order] = await pool.query("SELECT * FROM orders WHERE id = ?", [req.params.id]);
-    if (!order.length) return res.status(404).json({ error: "Not found" });
-
-    const [items] = await pool.query(`
-      SELECT oi.*, m.name
-      FROM order_items oi
-      LEFT JOIN menuitems m ON oi.item_id = m.id
-      WHERE oi.order_id = ?
-    `, [req.params.id]);
-
-    const parsedItems = items.map((item) => ({
-      ...item,
-      selected_extras: parseJsonSafe(item.selected_extras),
-      removed_extras:  parseJsonSafe(item.removed_extras),
-    }));
-
-    res.json({ order: order[0], items: parsedItems });
-  }),
-);
-
-/* ================================================================
-   CUSTOMER — Update payment splits (public, no auth required)
-   FIX: Checkout.js was calling /admin/orders/:id/status (auth-required)
-   to sync payer data. Customers have no JWT token → 401 on every keystroke.
-   This endpoint lets the customer page sync payment_splits and tip_amount
-   without changing the order status.
-   ================================================================ */
-app.put(
-  "/orders/:id/splits",
-  asyncHandler(async (req, res) => {
-    const orderId = req.params.id;
-    const { payment_splits, tip_amount } = req.body;
-
-    const updates = [];
-    const values  = [];
-
-    if (payment_splits !== undefined) {
-      updates.push("payment_splits = ?");
-      values.push(JSON.stringify(payment_splits));
-    }
-    if (tip_amount !== undefined) {
-      updates.push("tip_amount = ?");
-      values.push(Number(tip_amount) || 0);
-    }
-
-    if (updates.length === 0) return res.json({ success: true });
-
-    values.push(orderId);
-    await pool.query(
-      `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
-      values
-    );
-    res.json({ success: true });
-  })
-);
-
-/* ================================================================
-   STAFF LOGIN
-   ================================================================ */
-app.post(
-  "/staff/login",
-  authLimiter,
+  "/api/staff/login",
   validateRequest(staffLoginValidators),
   asyncHandler(async (req, res) => {
-    if (!process.env.JWT_SECRET) {
-      return res.status(503).json({ error: "Authentication unavailable until JWT_SECRET is configured." });
-    }
-
     const { username, password } = req.body;
-    console.log("LOGIN ATTEMPT:", username);
-    const user = findStaffUser(username);
-    console.log("FOUND USER:", user);
     
-    if (!verifyPassword(user, password)) {
+    console.log("\n========== LOGIN START ==========");
+    console.log("LOGIN JWT_SECRET:", process.env.JWT_SECRET);
+    console.log("JWT_SECRET length:", process.env.JWT_SECRET?.length);
+    
+    const user = await findStaffUser(username);
+    if (!user || !verifyPassword(password, user.passwordHash)) {
+      console.log("❌ Invalid credentials for:", username);
+      console.log("========== LOGIN END ==========\n");
       return res.status(401).json({ error: "Invalid credentials" });
     }
-
-    const token = signToken({ username: user.username, role: user.role, name: user.name });
-    res.json({ token, role: user.role, name: user.name });
+    
+    const token = signToken(user);
+    console.log("GENERATED TOKEN:", token);
+    console.log("✅ Login successful for:", username, "Role:", user.role);
+    console.log("========== LOGIN END ==========\n");
+    
+    // ✅ FIXED: Send clean response without passwordHash
+    res.json({ 
+      token, 
+      role: user.role,
+      name: user.name,
+      username: user.username
+    });
   }),
 );
 
-/* ================================================================
-   AI CHAT — Gemini Flash via Google Generative Language API
-   Handles: custom burger orders, menu questions, staff escalation
-   ================================================================ */
-const GEMINI_MODEL = "gemini-2.0-flash";
-
-app.post("/api/chat", async (req, res) => {
-  if (!process.env.GEMINI_API_KEY) {
-    console.warn("⚠️ /api/chat requested but GEMINI_API_KEY is not configured.");
-    return res.status(503).json({ error: "AI chat unavailable until GEMINI_API_KEY is configured." });
-  }
-
-  // Validate GEMINI_API_KEY format (should be alphanumeric-only, not a model name)
-  if (process.env.GEMINI_API_KEY.includes("/") || process.env.GEMINI_API_KEY.includes("-") && process.env.GEMINI_API_KEY.includes("it")) {
-    console.error("❌ GEMINI_API_KEY appears to be misconfigured (looks like a model name, not an API key)");
-    return res.status(503).json({ error: "GEMINI_API_KEY is misconfigured. Please use a valid Google Gemini API key." });
-  }
-
-  const { messages, menuItems } = req.body;
-
-  if (!messages || !Array.isArray(messages)) {
-    console.warn("⚠️ /api/chat received invalid messages:", typeof messages);
-    return res.status(400).json({ error: "messages array required" });
-  }
-
-  // Fetch available add-on extras from DB (columns: id, name, price)
-  let extrasText = "AVAILABLE ADD-ON EXTRAS:\n";
+app.put("/orders/:id/confirm-payment", async (req, res) => {
   try {
-    const [extras] = await pool.query("SELECT name, price FROM extra_options");
-    if (extras.length > 0) {
-      extras.forEach((ext) => { extrasText += `- ${ext.name} (+$${Number(ext.price).toFixed(2)})\n`; });
-    } else {
-      extrasText += "No extras currently available.\n";
-    }
-  } catch (err) {
-    console.error("❌ Error fetching extras:", err.message);
-    extrasText += "Extras currently unavailable.\n";
-  }
+    const { id } = req.params;
+    const { paymentStatus } = req.body;
 
-  // Build menu list from the payload sent by the frontend
-  let menuList = "AVAILABLE MENU ITEMS:\n";
-  if (menuItems && menuItems.length > 0) {
-    menuItems.forEach((item) => { menuList += `- ${item.name} — $${item.price}\n`; });
-  } else {
-    menuList += "Menu is currently unavailable.\n";
-  }
-
-  const SYSTEM_PROMPT = `You are "Sami", the friendly assistant at Snack Attack restaurant in Lebanon.
-
-════════════════════════════════════════
-LANGUAGE RULE — HIGHEST PRIORITY
-════════════════════════════════════════
-You will receive a [LANGUAGE:xxx] tag before every user message. Always reply in that language.
-
-[LANGUAGE:ARABIC]  → Arabic letters only (أحرف عربية). No English or Franco.
-[LANGUAGE:FRANCO]  → Franco Lebanese only (Latin + numbers like 3,2,7). No Arabic letters.
-[LANGUAGE:ENGLISH] → Pure English only. No Arabic or Franco.
-
-Always match the LATEST [LANGUAGE:xxx] tag. Never mix languages.
-════════════════════════════════════════
-
-RESTAURANT INFO:
-- Name: Snack Attack, Hamra - Bliss Street
-- Hours: Every day, 11:00 AM to 11:00 PM
-- Phone: 03 231 506
-
-${menuList}
-${extrasText}
-
-══════════════════════════════════
-ORDER FLOW — FOLLOW EXACTLY
-══════════════════════════════════
-
-STEP 1 — COLLECT ALL DETAILS (one question at a time):
-  Ask: bread type → protein → cheese → veggies → sauce
-  After that ask: "Baddak fries?" → then "Shu baddak teshrab?"
-
-STEP 2 — CONFIRMATION (MANDATORY before any action):
-  Once you have everything, show a clear summary and ask for confirmation.
-  Example (Franco):
-    "So checkup 3al sari3:
-     - Sandwich: brioche bun + beef patty + cheddar + lettuce & tomato + garlic sauce
-     - Fries: yes
-     - Drink: Pepsi
-     Mashi heik?"
-
-  Example (Arabic):
-    "للتأكيد قبل ما نكمل:
-     - ساندويش: خبز بريوش + لحمة + شيدر + خس وبندورة + صوص ثوم
-     - فريز: آه
-     - مشروب: بيبسي
-     هيك منيح؟"
-
-  Example (English):
-    "Let me confirm your order before we proceed:
-     - Sandwich: brioche bun + beef patty + cheddar + lettuce & tomato + garlic sauce
-     - Fries: yes
-     - Drink: Pepsi
-     Does that look right?"
-
-STEP 3 — SEND ACTION + SUMMARY (only after customer confirms):
-  Append the CUSTOM_ORDER action, then show the receipt summary.
-
-  Franco example:
-    "Perfect! Talab l order. Hayda moukhtasar talab-ak:
-
-     ┌─────────────────────────────┐
-     │  SNACK ATTACK — TABLE [X]   │
-     ├─────────────────────────────┤
-     │  Custom Burger              │
-     │  • Bread  : Brioche Bun     │
-     │  • Protein: Beef Patty      │
-     │  • Cheese : Cheddar         │
-     │  • Veggies: Lettuce, Tomato │
-     │  • Sauce  : Garlic Sauce    │
-     │                             │
-     │  + Fries                    │
-     │  + Pepsi                    │
-     └─────────────────────────────┘
-     Mashkour 3ala talabak! Ra7 youssal 2ariban."
-
-  English example:
-    "All set! Here's your order summary:
-
-     ┌─────────────────────────────┐
-     │  SNACK ATTACK — TABLE [X]   │
-     ├─────────────────────────────┤
-     │  Custom Burger              │
-     │  • Bread  : Brioche Bun     │
-     │  • Protein: Beef Patty      │
-     │  • Cheese : Cheddar         │
-     │  • Veggies: Lettuce, Tomato │
-     │  • Sauce  : Garlic Sauce    │
-     │                             │
-     │  + Fries                    │
-     │  + Pepsi                    │
-     └─────────────────────────────┘
-     Thank you! Your order is on its way."
-
-  Arabic example:
-    "تمام! هيدا ملخص طلبك:
-
-     ┌─────────────────────────────┐
-     │  SNACK ATTACK — طاولة [X]   │
-     ├─────────────────────────────┤
-     │  برغر مخصص                  │
-     │  • خبز   : بريوش            │
-     │  • لحمة  : بيف باتي         │
-     │  • جبنة  : شيدر             │
-     │  • خضار  : خس وبندورة      │
-     │  • صوص   : ثوم              │
-     │                             │
-     │  + فريز                     │
-     │  + بيبسي                    │
-     └─────────────────────────────┘
-     شكراً لطلبك! رح يوصل قريباً."
-
-IMPORTANT RULES:
-1. NEVER skip the confirmation step (Step 2). Always ask before placing.
-2. NEVER place the order if the customer hasn't confirmed yet.
-3. If customer says "no" or wants to change something, go back and ask what to fix.
-4. Always use Lebanese dialect. Never use Fusha. Never say "دابا" or "واش".
-5. SANDWICH = BURGER. Same thing. Never say you don't have sandwiches.
-6. No emojis. Keep replies short and clear.
-
-═══════════════════════════════════════
-ACTIONS — append silently at end of message, never explain to customer
-═══════════════════════════════════════
-
-Add a regular menu item to cart:
-  CART_ADD:Exact Item Name
-
-Place a confirmed custom burger order:
-  CUSTOM_ORDER:{"bread":"...","protein":"...","cheese":"...","veggies":"...","sauce":"...","notes":""}
-
-Escalate to staff:
-  NEED_ADMIN:reason
-  (reasons: confused / complaint / request / offensive)`;
-
-  try {
-    // Map frontend message format to Gemini format
-    const mapped = messages.map((m) => ({
-      role:  m.role === "assistant" ? "model" : "user",
-      parts: [{ text: m.content || " " }],
-    }));
-
-    // Gemini requires alternating turns — merge consecutive same-role messages
-    const contents = [];
-    for (const msg of mapped) {
-      const last = contents[contents.length - 1];
-      if (last && last.role === msg.role) {
-        last.parts[0].text += "\n" + msg.parts[0].text;
-      } else {
-        contents.push({ ...msg, parts: [{ text: msg.parts[0].text }] });
-      }
+    const validStatuses = ["Paid", "Pending", "Failed"];
+    if (!validStatuses.includes(paymentStatus)) {
+      return res.status(400).json({ error: "Invalid payment status" });
     }
 
-    // Conversation must start with a user turn
-    while (contents.length > 0 && contents[0].role !== "user") contents.shift();
+    await pool.query("UPDATE orders SET payment_status = ?, updated_at = NOW() WHERE id = ?", [
+      paymentStatus,
+      id,
+    ]);
 
-    if (contents.length === 0)
-      return res.status(400).json({ error: "Conversation empty after cleaning" });
-
-    // Inject language tag into every user turn so the model always knows which language to use
-    contents.forEach((msg) => {
-      if (msg.role === "user") {
-        const lang = detectLanguage(msg.parts[0].text);
-        const tag  = lang === "arabic"
-          ? "[LANGUAGE:ARABIC] — Reply in Arabic letters ONLY.\n"
-          : lang === "franco"
-          ? "[LANGUAGE:FRANCO] — Reply in Franco Lebanese ONLY.\n"
-          : "[LANGUAGE:ENGLISH] — Reply in pure English ONLY.\n";
-
-        msg.parts[0].text = tag + msg.parts[0].text;
-        console.log(`🌐 Language: ${lang.toUpperCase()} — "${msg.parts[0].text.slice(0, 60)}..."`);
-      }
+    res.json({
+      success: true,
+      message: `Order ${id} payment status updated to ${paymentStatus}`,
     });
-
-    const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
-
-    console.log(`📡 Calling Gemini API (${GEMINI_MODEL})...`);
-    console.log(`📍 URL base: https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`);
-
-
-    let response;
-    try {
-      response = await fetch(GEMINI_URL, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents,
-          systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT }],
-          },
-          generationConfig: {
-            temperature:     0.5,
-            maxOutputTokens: 500,
-          },
-        }),
-      });
-    } catch (fetchErr) {
-      console.error("❌ Gemini fetch failed:", fetchErr.message);
-      return res.status(503).json({ error: "Failed to reach Gemini API. Please try again." });
-    }
-
-    let data;
-    try {
-      data = await response.json();
-    } catch (parseErr) {
-      console.error("❌ Gemini response parse error:", parseErr.message);
-      console.error("❌ Response status:", response.status);
-      return res.status(502).json({ error: "Invalid response from Gemini API." });
-    }
-
-    if (!response.ok) {
-      const errorMsg = data?.error?.message || JSON.stringify(data);
-      console.error(`❌ Gemini API returned ${response.status}:`, errorMsg);
-      console.error("❌ Full error response:", JSON.stringify(data, null, 2));
-      
-      if (response.status === 401 || response.status === 403) {
-        return res.status(503).json({ error: "Gemini API authentication failed. Check GEMINI_API_KEY." });
-      }
-      if (response.status === 429) {
-        return res.status(429).json({ error: "Gemini API rate limit exceeded. Please try again soon." });
-      }
-      
-      return res.status(502).json({ error: "Gemini API error. Please try again." });
-    }
-
-    const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (!reply) {
-      console.error("❌ Gemini returned empty reply. Response:", JSON.stringify(data, null, 2));
-      return res.status(502).json({ error: "Gemini API returned empty response." });
-    }
-
-    console.log(`✅ Gemini replied: "${reply.slice(0, 100)}..."`);
-    res.json({ reply });
   } catch (err) {
-    console.error("❌ /api/chat route error:", err.message, err.stack);
-    res.status(500).json({ error: "Internal server error. Please try again." });
+    console.error("Error updating order payment:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-/* ================================================================
-   SOCKET.IO — Real-time presence tracking per order room
-   ================================================================ */
-
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  if (!token) return next();
-
+app.get("/api/admin/orders", authenticateJWT, requireRole("admin", "waiter", "kitchen"), async (req, res) => {
   try {
-    socket.user = jwt.verify(token, process.env.JWT_SECRET || "");
-    return next();
-  } catch (err) {
-    return next(new Error("Unauthorized socket connection"));
-  }
-});
-
-io.on("connection", (socket) => {
-
-  socket.on("chatMessage", ({ tableId, message }) => {
-    if (!tableId || typeof message !== "string") return;
-    const room = getRoomName("table", tableId);
-    const sanitizedMessage = sanitizeText(message);
-    io.to(room).emit("chatMessage", {
-      message: sanitizedMessage,
-      sender: socket.user?.name || "Guest",
-      timestamp: new Date().toISOString(),
-    });
-  });
-
-  socket.on("joinOrder", (orderId) => {
-    const room = getRoomName("order", orderId);
-    socket.join(room);
-    if (!presence[room]) presence[room] = new Set();
-    presence[room].add(socket.id);
-    io.to(room).emit("presenceUpdate", { count: presence[room].size });
-  });
-
-  socket.on("disconnect", () => {
-    for (const [room, set] of Object.entries(presence)) {
-      if (set.has(socket.id)) {
-        set.delete(socket.id);
-        if (set.size === 0) {
-          delete presence[room];
-        } else {
-          io.to(room).emit("presenceUpdate", { count: set.size });
-        }
-      }
-    }
-  });
-});
-
-/* ================================================================
-   STRIPE — Create Payment Intent
-   ================================================================ */
-app.post(
-  "/create-payment-intent",
-  asyncHandler(async (req, res) => {
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(503).json({ error: "Stripe unavailable" });
-    }
-
-    const { orderId } = req.body;
-
-    if (!orderId) {
-      return res.status(400).json({
-        error: "orderId is required",
-      });
-    }
-
-    const [orderRows] = await pool.query(
-      "SELECT id, total_price, status FROM orders WHERE id = ?",
-      [orderId]
+    const [rows] = await pool.query(
+      `SELECT 
+         o.*,
+         GROUP_CONCAT(
+           JSON_OBJECT(
+             'payment_id', ps.payment_id,
+             'payer_name', ps.payer_name,
+             'payer_phone', ps.payer_phone,
+             'amount_usd', ps.amount_usd,
+             'currency', ps.currency,
+             'method', ps.method,
+             'payment_status', ps.payment_status,
+             'stripe_card_brand', ps.stripe_card_brand,
+             'stripe_card_last4', ps.stripe_card_last4,
+             'confirmed_at', ps.confirmed_at
+           )
+         ) as payment_splits_json
+       FROM orders o
+       LEFT JOIN payment_splits ps ON o.id = ps.order_id
+       GROUP BY o.id
+       ORDER BY o.created_at DESC`
     );
 
-    if (!orderRows.length) {
+    const orders = rows.map((order) => {
+      const items = parseJsonSafe(order.items, []);
+      let paymentSplits = [];
+      if (order.payment_splits_json) {
+        try {
+          const splitStr = `[${order.payment_splits_json}]`;
+          paymentSplits = JSON.parse(splitStr);
+        } catch (e) {
+          paymentSplits = [];
+        }
+      }
+      return {
+        id: order.id,
+        table_id: order.table_id,
+        status: order.status,
+        items,
+        total_price: order.total_price,
+        special_notes: order.special_notes,
+        created_at: order.created_at,
+        payment_splits: paymentSplits,
+        tip_amount: order.tip_amount || 0,
+      };
+    });
+
+    res.json({ success: true, orders });
+  } catch (err) {
+    console.error("Error fetching orders:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/admin/orders/:id/status",
+  authenticateJWT,
+  requireRole("admin", "waiter", "kitchen"),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    const validStatuses = ["Requested", "Accepted", "PaymentPending", "Paid-Accepted", "Paid-Preparing", "Paid-Ready", "Paid", "Rejected", "Cancelled"];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+
+    await pool.query("UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?", [status, id]);
+
+    io.emit("order:status-updated", { orderId: id, status });
+
+    res.json({ success: true, message: `Order ${id} status updated to ${status}` });
+  }),
+);
+
+app.delete("/api/admin/orders/:id",
+  authenticateJWT,
+  requireRole("admin"),
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    await pool.query("DELETE FROM orders WHERE id = ?", [id]);
+    io.emit("order:deleted", { orderId: id });
+    res.json({ success: true, message: `Order ${id} deleted` });
+  }),
+);
+
+app.get("/api/menu", async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT * FROM menuitems ORDER BY name");
+    res.json({
+      success: true,
+      menu: rows,
+    });
+  } catch (err) {
+    console.error("Error fetching menu:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/extras", async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT * FROM extra_options");
+    res.json({
+      success: true,
+      extras: rows,
+    });
+  } catch (err) {
+    console.error("Error fetching extras:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get(
+  "/api/orders/:orderId",
+  asyncHandler(async (req, res) => {
+    const { orderId } = req.params;
+    const [orders] = await pool.query("SELECT * FROM orders WHERE id = ?", [orderId]);
+    if (orders.length === 0) {
+      return res.status(404).json({ error: "Order not found" });
+    }
+    const order = orders[0];
+    order.items = parseJsonSafe(order.items, []);
+    res.json({ success: true, order });
+  }),
+);
+
+app.post(
+  "/api/orders",
+  validateRequest(placeOrderValidators),
+  asyncHandler(async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+      const { tableId, items, totalPrice, specialNotes } = req.body;
+
+      const itemsData = JSON.stringify(items);
+      const notes = specialNotes ? sanitizeText(specialNotes) : null;
+
+      const validatedItems = await validateOrderItems(conn, items, totalPrice);
+
+      const [result] = await conn.query(
+        `INSERT INTO orders (table_id, items, total_price, special_notes, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'Requested', NOW(), NOW())`,
+        [parseInt(tableId) || 1, itemsData, totalPrice, notes],
+      );
+
+      const orderId = result.insertId;
+
+      io.emit("order:placed", {
+        id: orderId,
+        tableId,
+        items: validatedItems,
+        totalPrice,
+        specialNotes: notes,
+        createdAt: new Date(),
+      });
+
+      res.status(201).json({
+        success: true,
+        message: "Order placed successfully",
+        orderId,
+      });
+    } finally {
+      conn.release();
+    }
+  }),
+);
+
+app.post("/api/chat", chatLimiter, async (req, res) => {
+  try {
+    const { message, orderId } = req.body;
+    if (!message || typeof message !== "string" || message.trim().length === 0) {
+      return res.status(400).json({ error: "Message cannot be empty" });
+    }
+    if (message.length > 1000) {
+      return res.status(400).json({ error: "Message is too long (max 1000 characters)" });
+    }
+
+    const detectedLang = detectLanguage(message);
+
+    io.emit("chat:message", {
+      message,
+      orderId,
+      language: detectedLang,
+      timestamp: new Date(),
+    });
+
+    res.json({
+      success: true,
+      message: "Message sent",
+      language: detectedLang,
+    });
+  } catch (error) {
+    console.error("Chat error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post(
+  "/api/payment-intent",
+  validateRequest(paymentIntentValidators),
+  asyncHandler(async (req, res) => {
+    const { orderId } = req.body;
+
+    const [orders] = await pool.query("SELECT * FROM orders WHERE id = ?", [orderId]);
+    if (orders.length === 0) {
       return res.status(404).json({
         error: "Order not found",
       });
     }
 
-    const order = orderRows[0];
+    const order = orders[0];
 
-    // Prevent duplicate payment
     if (order.status === "Paid") {
       return res.status(400).json({
         error: "Order already paid",
@@ -1013,10 +611,6 @@ app.post(
 
     const amountInCents = Math.round(total * 100);
 
-    // FIX (Issue 7): Idempotency key prevents duplicate charges on retries/double-taps
-    // FIX (Issue 12): payment_method_types: ["card"] matches the CardElement UI;
-    //                 automatic_payment_methods was for PaymentElement and offered
-    //                 wallets/bank-debits that the frontend couldn't collect.
     const paymentIntent = await stripe.paymentIntents.create(
       {
         amount: amountInCents,
@@ -1037,6 +631,658 @@ app.post(
     });
   })
 );
+
+/* ================================================================
+   PAYMENT SYSTEM ROUTES - INTEGRATED PAYMENT HANDLERS
+   ================================================================ */
+
+// ============================================
+// HELPER: Get order by ID
+// ============================================
+async function getOrder(orderId) {
+  const [orders] = await pool.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+  return orders[0] || null;
+}
+
+// ============================================
+// HELPER: Create payment in database
+// ============================================
+async function createPaymentSplit(orderId, paymentData) {
+  const paymentId = `payment_${uuidv4()}`;
+  
+  const [result] = await pool.query(
+    `INSERT INTO payment_splits 
+     (order_id, payment_id, payer_name, payer_phone, amount_usd, currency, method, payment_status, owner_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    [
+      orderId,
+      paymentId,
+      paymentData.payer_name,
+      paymentData.payer_phone,
+      paymentData.amount_usd,
+      paymentData.currency,
+      paymentData.method,
+      paymentData.owner_id,
+    ]
+  );
+  
+  return paymentId;
+}
+
+// ============================================
+// HELPER: Get payment by ID
+// ============================================
+async function getPayment(paymentId) {
+  const [payments] = await pool.query('SELECT * FROM payment_splits WHERE payment_id = ?', [paymentId]);
+  return payments[0] || null;
+}
+
+// ============================================
+// ENDPOINT 1: POST /api/orders/:orderId/payment/initiate
+// Customer initiates payment (cash or card)
+// ============================================
+app.post('/api/orders/:orderId/payment/initiate', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const {
+      method,
+      amount_usd,
+      currency,
+      payer_name,
+      payer_phone,
+      owner_id,
+    } = req.body;
+
+    if (!['cash', 'card'].includes(method)) {
+      return res.status(400).json({ success: false, error: 'Invalid payment method' });
+    }
+    if (amount_usd <= 0) {
+      return res.status(400).json({ success: false, error: 'Amount must be greater than 0' });
+    }
+    if (!payer_name || !payer_phone) {
+      return res.status(400).json({ success: false, error: 'Payer name and phone required' });
+    }
+
+    const order = await getOrder(orderId);
+    if (!order) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+
+   const paymentId = await createPaymentSplit(orderId, {
+  payer_name,
+  payer_phone,
+  amount_usd,
+  currency,
+  method,
+  owner_id,
+});
+
+// ✅ UPDATE ORDER STATUS TO PaymentPending
+await pool.query(
+  'UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?',
+  ['PaymentPending', orderId]
+);
+
+
+
+    let stripeClientSecret = null;
+    if (method === 'card') {
+      const intent = await stripe.paymentIntents.create({
+        amount: Math.round(amount_usd * 100),
+        currency: 'usd',
+        description: `Order #${orderId}`,
+        metadata: {
+          orderId: orderId.toString(),
+          paymentId,
+        },
+      });
+      stripeClientSecret = intent.client_secret;
+    }
+
+    io.emit('order:payment-initiated', {
+      orderId,
+      paymentId,
+      method,
+      amount_usd,
+      payer_name,
+      created_at: new Date(),
+    });
+
+    console.log('💳 Payment initiated:', { orderId, method, amount_usd });
+
+    return res.json({
+      success: true,
+      payment: {
+        id: paymentId,
+        status: 'pending',
+        method,
+        amount_usd,
+        payer_name,
+      },
+      stripe: {
+        clientSecret: stripeClientSecret,
+      },
+    });
+  } catch (error) {
+    // 👇 BETTER logging
+    console.error('💥 Payment initiate ERROR:');
+    console.error('  Message:', error.message);
+    console.error('  Code:', error.code);
+    console.error('  Stack:', error.stack);
+    console.error('  Full:', error);
+    
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || error.code || 'Unknown error' 
+    });
+  }
+});
+
+// ============================================
+// ENDPOINT 2: POST /api/orders/:orderId/payment/stripe-confirm
+// Stripe has successfully charged - THIS IS THE FIX FOR ADMIN!
+// ============================================
+app.post('/api/orders/:orderId/payment/stripe-confirm', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const {
+      paymentId,
+      stripeChargeId,
+      stripeIntentId,
+      cardBrand,
+      cardLast4,
+      receiptUrl,
+    } = req.body;
+
+    const [existing] = await pool.query(
+      'SELECT * FROM payment_splits WHERE stripe_charge_id = ?',
+      [stripeChargeId]
+    );
+    if (existing.length > 0) {
+      return res.json({
+        success: true,
+        message: 'Payment already processed',
+        payment: existing[0],
+      });
+    }
+
+    const transactionRef = `${cardBrand.toUpperCase()} ••••${cardLast4}`;
+    
+    await pool.query(
+      `UPDATE payment_splits 
+       SET 
+         stripe_charge_id = ?,
+         stripe_payment_intent_id = ?,
+         stripe_card_brand = ?,
+         stripe_card_last4 = ?,
+         stripe_receipt_url = ?,
+         transaction_ref = ?,
+         payment_status = ?,
+         transaction_details = ?,
+         updated_at = NOW()
+       WHERE payment_id = ?`,
+      [
+        stripeChargeId,
+        stripeIntentId,
+        cardBrand,
+        cardLast4,
+        receiptUrl,
+        transactionRef,
+        'paid',
+        JSON.stringify({
+          stripe_charge_id: stripeChargeId,
+          card_brand: cardBrand,
+          card_last4: cardLast4,
+          receipt_url: receiptUrl,
+          confirmed_at: new Date(),
+        }),
+        paymentId,
+      ]
+    );
+
+    await pool.query(
+      'UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?',
+      ['PaymentPending', orderId]
+    );
+
+    const payment = await getPayment(paymentId);
+    
+    io.emit('order:payment-confirmed-stripe', {
+      orderId,
+      payment,
+      transactionRef,
+      message: `✅ Card payment confirmed: ${transactionRef}`,
+    });
+
+    console.log('✅ Stripe confirmed:', { orderId, paymentId, cardBrand, cardLast4 });
+
+    return res.json({
+      success: true,
+      payment,
+      message: 'Stripe payment confirmed',
+    });
+  } catch (error) {
+    console.error('Stripe confirm error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// ENDPOINT 3: POST /api/orders/:orderId/payment/cash-confirm
+// ============================================
+app.post('/api/orders/:orderId/payment/cash-confirm', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { paymentId } = req.body;
+
+    const payment = await getPayment(paymentId);
+    if (!payment) {
+      return res.status(404).json({ success: false, error: 'Payment not found' });
+    }
+
+    await pool.query(
+      'UPDATE payment_splits SET payment_status = ?, updated_at = NOW() WHERE payment_id = ?',
+      ['paid', paymentId]
+    );
+
+    await pool.query(
+      'UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?',
+      ['PaymentPending', orderId]
+    );
+
+    io.emit('order:payment-initiated', {
+      orderId,
+      paymentId,
+      method: 'cash',
+      amount_usd: payment.amount_usd,
+      payer_name: payment.payer_name,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Cash payment confirmed',
+      payment,
+    });
+  } catch (error) {
+    console.error('Cash confirm error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// ENDPOINT 4: PUT /api/orders/:orderId/payment/confirm
+// Admin confirms payment
+// ============================================
+app.put('/api/orders/:orderId/payment/confirm', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { paymentId, adminId } = req.body;
+
+    const [existing] = await pool.query(
+      'SELECT * FROM payment_splits WHERE payment_id = ? AND confirmed_at IS NOT NULL',
+      [paymentId]
+    );
+    if (existing.length > 0) {
+      return res.json({
+        success: true,
+        message: 'Payment already confirmed',
+        payment: existing[0],
+      });
+    }
+
+    await pool.query(
+      `UPDATE payment_splits 
+       SET confirmed_at = NOW(), confirmed_by_admin = ?, updated_at = NOW()
+       WHERE payment_id = ?`,
+      [adminId, paymentId]
+    );
+
+    const [allPayments] = await pool.query(
+      'SELECT * FROM payment_splits WHERE order_id = ?',
+      [orderId]
+    );
+
+    const allConfirmed = allPayments.every(p => p.confirmed_at);
+
+    if (allConfirmed) {
+      await pool.query(
+        `UPDATE orders SET 
+         status = ?, 
+         payment_confirmed_at = NOW(),
+         payment_confirmed_by = ?,
+         updated_at = NOW()
+         WHERE id = ?`,
+        ['Paid-Accepted', adminId, orderId]
+      );
+    }
+
+    io.to(`order-${orderId}`).emit('payment:confirmed', {
+      orderId,
+      status: 'Paid-Accepted',
+      confirmedAt: new Date(),
+    });
+
+    io.emit('order:payment-admin-confirmed', {
+      orderId,
+      paymentId,
+    });
+
+    console.log('👨‍💼 Admin confirming payment:', { orderId, paymentId });
+
+    return res.json({
+      success: true,
+      message: 'Payment confirmed by admin',
+      order: { id: orderId, status: 'Paid-Accepted' },
+    });
+  } catch (error) {
+    console.error('Payment confirm error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// ENDPOINT 5: PUT /api/orders/:orderId/payment/reject
+// ============================================
+app.put('/api/orders/:orderId/payment/reject', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { paymentId, adminId, reason } = req.body;
+
+    await pool.query(
+      `UPDATE payment_splits 
+       SET payment_status = ?, confirmed_at = NOW(), confirmed_by_admin = ?, 
+           confirmation_notes = ?, updated_at = NOW()
+       WHERE payment_id = ?`,
+      ['rejected', adminId, reason, paymentId]
+    );
+
+    await pool.query(
+      'UPDATE orders SET status = ?, updated_at = NOW() WHERE id = ?',
+      ['Rejected', orderId]
+    );
+
+    io.to(`order-${orderId}`).emit('payment:rejected', {
+      orderId,
+      reason,
+    });
+
+    console.log('❌ Admin rejecting payment:', { orderId, paymentId, reason });
+
+    return res.json({
+      success: true,
+      message: 'Payment rejected',
+    });
+  } catch (error) {
+    console.error('Payment reject error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// ENDPOINT 6: GET /api/admin/orders?status=payment-pending
+// ============================================
+app.get('/api/admin/orders-payment', async (req, res) => {
+  try {
+    const { status = 'PaymentPending', limit = 20 } = req.query;
+
+    const [rows] = await pool.query(
+      `SELECT 
+         o.id, o.status, o.table_id, o.total_price, o.created_at,
+         ps.id as ps_id, ps.payment_id, ps.payer_name, ps.method, ps.amount_usd, 
+         ps.stripe_card_brand, ps.stripe_card_last4, ps.transaction_ref,
+         ps.stripe_receipt_url, ps.payment_status, ps.confirmed_at, ps.confirmed_by_admin,
+         ps.created_at as payment_created_at
+       FROM orders o
+       LEFT JOIN payment_splits ps ON o.id = ps.order_id
+       WHERE o.status = ?
+       ORDER BY o.created_at DESC
+       LIMIT ?`,
+      [status, parseInt(limit)]
+    );
+
+    const orders = {};
+    rows.forEach(row => {
+      if (!orders[row.id]) {
+        orders[row.id] = {
+          id: row.id,
+          status: row.status,
+          table_id: row.table_id,
+          total_price: row.total_price,
+          created_at: row.created_at,
+          payments: [],
+        };
+      }
+      
+      if (row.ps_id) {
+        orders[row.id].payments.push({
+          id: row.payment_id,
+          payer_name: row.payer_name,
+          method: row.method,
+          amount_usd: row.amount_usd,
+          status: row.payment_status,
+          transaction_ref: row.transaction_ref,
+          stripe: {
+            card_brand: row.stripe_card_brand,
+            card_last4: row.stripe_card_last4,
+            receipt_url: row.stripe_receipt_url,
+          },
+          confirmed_at: row.confirmed_at,
+          confirmed_by_admin: row.confirmed_by_admin,
+          created_at: row.payment_created_at,
+        });
+      }
+    });
+
+    console.log('📋 Admin fetching orders with status:', status);
+
+    return res.json({
+      success: true,
+      orders: Object.values(orders),
+    });
+  } catch (error) {
+    console.error('Get admin orders error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// ENDPOINT 7: GET /api/orders/:orderId/payments
+// ============================================
+app.get('/api/orders/:orderId/payments', async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    const [orderRows] = await pool.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+    if (orderRows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Order not found' });
+    }
+
+    const order = orderRows[0];
+
+    const [paymentRows] = await pool.query(
+      'SELECT * FROM payment_splits WHERE order_id = ?',
+      [orderId]
+    );
+
+    return res.json({
+      success: true,
+      order: {
+        ...order,
+        payments: paymentRows,
+      },
+    });
+  } catch (error) {
+    console.error('Get order error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.put('/api/orders/:orderId/splits', asyncHandler(async (req, res) => {
+  const { orderId } = req.params;
+  const { payment_splits, tip_amount } = req.body;
+
+  await pool.query(
+    'UPDATE orders SET payment_splits = ?, tip_amount = ?, updated_at = NOW() WHERE id = ?',
+    [
+      payment_splits ? JSON.stringify(payment_splits) : null,
+      tip_amount || 0,
+      orderId
+    ]
+  );
+
+  res.json({ success: true, message: 'Splits updated' });
+}));
+// ============================================
+// ENDPOINT: POST /api/ai-chat
+// AI chatbot via Anthropic Claude
+// ============================================
+app.post("/api/ai-chat", chatLimiter, asyncHandler(async (req, res) => {
+ console.log("🤖 AI chat request received");
+  console.log("GEMINI_KEYS count:", GEMINI_KEYS.length);
+  console.log("Messages count:", req.body?.messages?.length);
+  const { messages, menuContext } = req.body;
+
+ if (GEMINI_KEYS.length === 0) {
+  return res.status(503).json({ success: false, error: "AI chat not configured" });
+}
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ success: false, error: "Messages required" });
+  }
+
+  const systemPrompt = `You are Snack, a smart friendly assistant at Snack Attack restaurant in Hamra, Beirut.
+${menuContext || "Menu not available yet."}
+
+=== LANGUAGE RULES — ABSOLUTE ===
+Count how many messages the customer has sent so far.
+Default language is English. But if customer writes Franco (bde, shu, 3andi, kifak, yalla, mni7, hek, wallah, 3anna, kmn, oulon, btekhtare) IMMEDIATELY switch to Franco and STAY in Franco for the rest of the conversation.
+From the 3rd message onwards: detect their language and match it exactly.
+- Franco words (bde, shu, 3andi, kifak, yalla, mni7, ktir, hek, wallah): reply in Franco
+- Arabic script: reply in Arabic
+- English only: reply in English
+Short words like "hi", "ok", "yes" alone do NOT change the language — keep the established style.
+NEVER use markdown, asterisks, bold, or bullet points. Plain text only.
+When customer asks about available options (cheese, sauces, vegetables, extras), list ALL items from the AVAILABLE EXTRAS section provided. Never say you only have a few options if the list is longer.
+
+=== CRITICAL LANGUAGE RULES ===
+Detect language from customer messages and NEVER mix languages:
+- If customer writes English only → reply in English only
+- If customer writes Franco (bde, shu, 3andi, kifak, yalla, mni7, hek, wallah, 3anna, kmn, tyb, eza, la2, akid, msh, ma, fi, w, l) → reply in Franco only, NO Arabic script ever
+- If customer writes Arabic script → reply in Arabic only
+NEVER write Arabic script (ا ب ت) if customer is using Franco. NEVER mix.
+
+=== BEHAVIOR ===
+- Always complete your sentences. Never cut off mid-word or mid-sentence.
+- Max 3 sentences per reply. Plain text only, no markdown, no asterisks.
+- If customer is rude, uses bad words, or insults → reply: "Sorry, that's not appropriate." then use NEED_ADMIN:offensive
+- Only mention items from the menu provided. Never invent items.
+- No vegan or fish/seafood items. If asked, apologize and suggest alternatives.
+
+=== RESTAURANT RULES ===
+No vegan items. No fish or seafood. If asked, apologize and suggest alternatives from the menu.
+
+=== ORDERING FLOW ===
+When customer wants food: "Would you like to pick from the menu, or build a custom burger?"
+For menu item → confirm and use CART_ADD:ExactItemName
+For custom burger, ask ONE question at a time:
+Step 1 - Protein: beef or chicken?
+Step 2 - Cheese: pick from available extras
+Step 3 - Sauce: pick from available extras
+Step 4 - Vegetables: what to add?
+Step 5 - Extras: anything else?
+Step 6 - Remove ingredients: Only ask "Shu baddak tsheel?" if customer chose a MENU burger (not custom). For custom burgers, skip this step and go directly to confirming the order then use CART_ADD:Custom Burger
+CRITICAL: After step 6 (remove ingredients), whether customer says yes or no, you MUST immediately use CART_ADD:Custom Burger on the same response. Never wait for another message. Never say thanks without adding to cart first.
+
+For menu items: if customer asks for multiple quantities like "2 Pepsi" or "3 burgers", use CART_ADD multiple times:
+Example: "2 Pepsi" → CART_ADD:Pepsi CART_ADD:Pepsi
+Example: "3 burgers" → CART_ADD:Burger CART_ADD:Burger CART_ADD:Burger
+
+If customer says no/la2/no thanks → IMMEDIATELY confirm the full order and use CART_ADD:Custom Burger
+Never leave the flow hanging after step 6.
+After CART_ADD, say: "Your custom burger has been added to your cart! Anything else?"
+
+For custom burger → ask "Shall I add your custom burger to the cart?" and wait for confirmation.
+After customer confirms, use EXACTLY this format on its own line:
+CUSTOM_ORDER:{"protein":"Beef","cheese":"Mozzarella","sauce":"BBQ Sauce","veggies":"Onions","bread":"brioche","notes":"","price":0}
+Replace the values with what the customer chose. Never leave placeholder text.
+NEVER use CART_ADD:Custom Burger — always use CUSTOM_ORDER with the full JSON details.
+=== ACTIONS ===
+CART_ADD:ItemName — adds item to cart
+NEED_ADMIN:reason — calls staff
+
+=== BEHAVIOR ===
+Max 2 short sentences per reply. Sound natural. No hallucination — only mention items from the menu provided.`;
+
+  const validMessages = messages
+    .slice(-8)
+    .filter(m => m.content && m.content.trim())
+    .map(m => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content.slice(0, 500) }],
+    }));
+
+  const firstUserIdx = validMessages.findIndex(m => m.role === "user");
+  const contents = firstUserIdx >= 0 ? validMessages.slice(firstUserIdx) : validMessages;
+
+  if (contents.length === 0) {
+    return res.status(400).json({ success: false, error: "No valid messages" });
+  }
+
+  // ✅ Retry up to 3 times on 429
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      const response = await fetch(
+       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${getGeminiKey(attempt - 1)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemPrompt }] },
+            contents,
+           generationConfig: { maxOutputTokens: 400, temperature: 0.7 },
+          }),
+        }
+      );
+
+      clearTimeout(timeout);
+      const data = await response.json();
+console.log("Gemini status:", response.status, "| error:", data?.error?.code, data?.error?.message);
+       if (!response.ok) {
+  const code = data?.error?.code;
+  
+  // ✅ كل error بيجرب key تاني
+  if (attempt < 3) {
+    await new Promise(r => setTimeout(r, 1000 * attempt));
+    continue;
+  }
+  
+  if (code === 429 || code === 503) {
+    return res.status(429).json({ success: false, error: "AI is busy, please try again in a moment" });
+  }
+  return res.status(500).json({ success: false, error: "AI service error" });
+}
+
+      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+      if (!reply) return res.status(500).json({ success: false, error: "Empty AI response" });
+
+      return res.json({ success: true, reply });
+
+    } catch (err) {
+      clearTimeout(timeout);
+      if (err.name === "AbortError") {
+        return res.status(504).json({ success: false, error: "AI response timeout" });
+      }
+      lastError = err;
+    }
+  }
+
+  return res.status(500).json({ success: false, error: lastError?.message || "AI service unavailable" });
+}));
 
 /* ================================================================
    START SERVER
