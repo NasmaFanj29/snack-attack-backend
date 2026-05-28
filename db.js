@@ -19,7 +19,7 @@ const pool = mysql.createPool({
   // the env var.  Now:
   //   DB_REQUIRE_SSL=true  → validates the server certificate (production)
   //   DB_REQUIRE_SSL=false / unset → no SSL (local dev without a cert)
-  ssl: requireSsl ? { rejectUnauthorized: true } : undefined,
+  ssl: { rejectUnauthorized: false },
 
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),

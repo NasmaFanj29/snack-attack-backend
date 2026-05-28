@@ -1236,7 +1236,7 @@ Max 2 short sentences per reply. Sound natural. No hallucination — only mentio
 
     try {
       const response = await fetch(
-       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${getGeminiKey(attempt - 1)}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${getGeminiKey(attempt - 1)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
