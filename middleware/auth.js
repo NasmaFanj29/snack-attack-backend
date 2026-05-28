@@ -17,7 +17,12 @@ const staffUsers = (() => {
       if (!Array.isArray(parsed) || parsed.length === 0) {
         throw new Error("STAFF_USERS_JSON must be a non-empty array.");
       }
-      return parsed;
+      return parsed.map((user) => ({
+  username: user.username,
+  role: user.role,
+  name: user.name,
+  passwordHash: user.passwordHash || bcrypt.hashSync(user.password || '', 10),
+}));
     } catch (err) {
       console.error("❌ STAFF_USERS_JSON is set but invalid:", err.message);
       process.exit(1);
