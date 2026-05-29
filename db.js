@@ -26,6 +26,7 @@ const pool = mysql.createPool({
   queueLimit: 0,
 });
 
+
 const dbWarnings = [];
 if (!process.env.DB_HOST)                              dbWarnings.push("DB_HOST");
 if (!process.env.DB_USER)                              dbWarnings.push("DB_USER");
