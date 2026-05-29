@@ -220,6 +220,27 @@ const io = new Server(server, {
 });
 
 const presence = {}; // { room: Set<socketId> }
+const tableUsers = {}; // { tableId: Set<socketId> }
+
+io.on('connection', (socket) => {
+  socket.on('joinTable', (tableId) => {
+    if (!tableId) return;
+    const tid = String(tableId);
+    if (!tableUsers[tid]) tableUsers[tid] = new Set();
+    tableUsers[tid].add(socket.id);
+    socket.data.tableId = tid;
+    io.emit('tableCount', { tableId: tid, count: tableUsers[tid].size });
+  });
+
+  socket.on('disconnect', () => {
+    const tid = socket.data.tableId;
+    if (tid && tableUsers[tid]) {
+      tableUsers[tid].delete(socket.id);
+      io.emit('tableCount', { tableId: tid, count: tableUsers[tid].size });
+    }
+  });
+});
+
 
 // ⭐ MAKE PAYMENT ROUTES ABLE TO ACCESS SOCKET.IO
 app.set('io', io);
@@ -295,10 +316,7 @@ async function validateOrderItems(conn, items, totalPrice) {
       specialNote,
     });
   }
-  // أضفه مؤقتاً جوا validateOrderItems قبل التحقق من الـ total
-console.log("DEBUG computedTotal:", computedTotal);
-console.log("DEBUG totalPrice received:", totalPrice);
-console.log("DEBUG with VAT:", computedTotal * 1.11);
+
 
 // ✅ AFTER
 const computedWithVAT = computedTotal * 1.11;
@@ -331,23 +349,14 @@ app.post(
   asyncHandler(async (req, res) => {
     const { username, password } = req.body;
     
-    console.log("\n========== LOGIN START ==========");
-    console.log("LOGIN JWT_SECRET:", process.env.JWT_SECRET);
-    console.log("JWT_SECRET length:", process.env.JWT_SECRET?.length);
-    
     const user = await findStaffUser(username);
     if (!user || !verifyPassword(password, user.passwordHash)) {
-      console.log("❌ Invalid credentials for:", username);
-      console.log("========== LOGIN END ==========\n");
+     
       return res.status(401).json({ error: "Invalid credentials" });
     }
     
     const token = signToken(user);
-    console.log("GENERATED TOKEN:", token);
-    console.log("✅ Login successful for:", username, "Role:", user.role);
-    console.log("========== LOGIN END ==========\n");
-    
-    // ✅ FIXED: Send clean response without passwordHash
+
     res.json({ 
       token, 
       role: user.role,

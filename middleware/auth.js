@@ -73,11 +73,7 @@ function signToken(user) {
 }
 
 function authenticateJWT(req, res, next) {
-  console.log("\n========== AUTH MIDDLEWARE START ==========");
-  console.log("VERIFY JWT_SECRET:", process.env.JWT_SECRET);
-  console.log("JWT_SECRET length:", process.env.JWT_SECRET?.length);
-  console.log("AUTH HEADER RAW:", req.headers.authorization);
-  
+ 
   if (!process.env.JWT_SECRET) {
     console.log("❌ JWT_SECRET is missing!");
     return res.status(503).json({ error: "Authentication unavailable until JWT_SECRET is configured." });
@@ -90,19 +86,15 @@ function authenticateJWT(req, res, next) {
   }
 
   const token = authHeader.split(" ")[1];
-  console.log("EXTRACTED TOKEN:", token);
-  console.log("TOKEN length:", token?.length);
+ 
   
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     console.log("✅ TOKEN VERIFIED:", decoded);
-    console.log("========== AUTH MIDDLEWARE END ==========\n");
+   
     req.user = decoded;
     return next();
   } catch (err) {
-    console.log("❌ JWT VERIFY ERROR:", err.message);
-    console.log("Error name:", err.name);
-    console.log("========== AUTH MIDDLEWARE END ==========\n");
     return res.status(401).json({ error: "Invalid or expired token" });
   }
 }
