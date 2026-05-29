@@ -14,7 +14,7 @@ function validateRequest(validations) {
 }
 
 const placeOrderValidators = [
-  body("tableId").exists().isInt({ min: 1 }),
+  body("tableId").exists().toInt().isInt({ min: 1 }),
   body("totalPrice").exists().isFloat({ gt: 0 }),
   body("items").isArray({ min: 1 }),
   body("items.*.name").exists().isString().trim().isLength({ min: 1 }),
