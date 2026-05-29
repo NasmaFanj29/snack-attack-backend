@@ -515,7 +515,8 @@ app.post(
   asyncHandler(async (req, res) => {
     const conn = await pool.getConnection();
     try {
-      const { tableId, items, totalPrice, specialNotes } = req.body;
+      const { tableNumber, items, totalPrice, specialNotes } = req.body;
+
 
       const itemsData = JSON.stringify(items);
       const notes = specialNotes ? sanitizeText(specialNotes) : null;
