@@ -522,17 +522,27 @@ app.post(
 
       const validatedItems = await validateOrderItems(conn, items, totalPrice);
 
+      // Resolve table_number → actual table id
+      const [tableRow] = await conn.query(
+        'SELECT id FROM tables WHERE table_number = ?',
+        [parseInt(tableId) || 1]
+      );
+      if (tableRow.length === 0) {
+        return res.status(400).json({ success: false, error: 'Table not found' });
+      }
+      const actualTableId = tableRow[0].id;
+
       const [result] = await conn.query(
         `INSERT INTO orders (table_id, items, total_price, special_notes, status, created_at, updated_at)
          VALUES (?, ?, ?, ?, 'Requested', NOW(), NOW())`,
-        [parseInt(tableId) || 1, itemsData, totalPrice, notes],
+        [actualTableId, itemsData, totalPrice, notes],
       );
 
       const orderId = result.insertId;
 
       io.emit("order:placed", {
         id: orderId,
-        tableId,
+        tableId: actualTableId,
         items: validatedItems,
         totalPrice,
         specialNotes: notes,
