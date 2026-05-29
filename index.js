@@ -621,7 +621,7 @@ app.post(
         },
       },
       {
-        idempotencyKey: `order_${orderId}`,
+        idempotencyKey: `order_${orderId}_${Date.now()}`,
       }
     );
 
